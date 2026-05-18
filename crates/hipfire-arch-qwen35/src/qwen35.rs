@@ -2547,8 +2547,8 @@ fn forward_from_x_gpu(
                 // KV cache write + attention (Q8 if available, FP32 fallback)
                 let attn_out = gpu.alloc_tensor(&[q_dim], DType::F32)?;
                 if kv_cache.quant_q8 {
-                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, config.n_kv_heads, config.head_dim)?;
-                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, config.n_kv_heads, config.head_dim, 0)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim, 0)?;
                     gpu.attention_q8_0_kv(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
@@ -2726,8 +2726,8 @@ fn forward_from_x_gpu(
 
                 let attn_out = gpu.alloc_tensor(&[q_dim], DType::F32)?;
                 if kv_cache.quant_q8 {
-                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, config.n_kv_heads, config.head_dim)?;
-                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, config.n_kv_heads, config.head_dim, 0)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, config.n_kv_heads, config.head_dim, 0)?;
                     gpu.attention_q8_0_kv(
                         &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &attn_out, &pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
@@ -6171,8 +6171,8 @@ fn run_fa_layer_body(
             )?;
         }
     } else if kv_cache.quant_q8 {
-        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
+        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
         gpu.attention_q8_0_kv(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, pos + 1,
@@ -6749,8 +6749,8 @@ fn forward_scratch_layers(
                         )?;
                     }
                 } else if kv_cache.quant_q8 {
-                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
                     // Flash dispatch (Q8 path):
                     //   - capture_mode (hipGraph): always flash — position-independent grid.
                     //   - flash_mode=2 (always): force flash at any ctx.
@@ -7140,8 +7140,8 @@ fn forward_scratch_layers(
                         )?;
                     }
                 } else if kv_cache.quant_q8 {
-                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
                     let use_flash = gpu.capture_mode
                         || s.flash_mode == 2
                         || (s.flash_mode == 1 && pos + 1 >= 2048)
@@ -7509,8 +7509,8 @@ fn forward_scratch_layers_multi(
                             )?;
                         }
                     } else if kv_cache.quant_q8 {
-                        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
+                        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
                         let use_flash = gpu.capture_mode
                             || s.flash_mode == 2
                             || (s.flash_mode == 1 && pos + 1 >= 2048)
@@ -7790,8 +7790,8 @@ fn forward_scratch_layers_multi(
                             )?;
                         }
                     } else if kv_cache.quant_q8 {
-                        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
+                        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim, 0)?;
                         let use_flash = gpu.capture_mode
                             || s.flash_mode == 2
                             || (s.flash_mode == 1 && pos + 1 >= 2048)

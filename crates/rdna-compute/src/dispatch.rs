@@ -15047,6 +15047,9 @@ impl Gpu {
     pub fn kv_cache_write_q8_0(
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
         n_kv_heads: usize, head_dim: usize,
+        // Ring-buffer cache capacity. 0 = no wrap (slot = pos directly).
+        // > 0: slot = pos % cache_capacity. Used for sliding-window KV.
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC, "kv_cache_write_q8_0")?;
@@ -15055,10 +15058,11 @@ impl Gpu {
         let p = pos_buf.as_ptr();
         let nkv = n_kv_heads as i32;
         let hd = head_dim as i32;
+        let cap = cache_capacity as i32;
         let mut params: Vec<*mut c_void> = vec![
             &d as *const _ as *mut c_void, &s as *const _ as *mut c_void,
             &p as *const _ as *mut c_void, &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void, &cap as *const _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
         let bytes = crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, head_dim);
@@ -15069,7 +15073,7 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(d); b.push_ptr(s); b.push_ptr(p);
-                b.push_i32(nkv); b.push_i32(hd);
+                b.push_i32(nkv); b.push_i32(hd); b.push_i32(cap);
                 b
             },
         );
@@ -15391,7 +15395,7 @@ impl Gpu {
             }
         }
         // V: standard Q8_0
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim, 0)
     }
 
     /// Fused K+V write for fwht4: K at signed-FWHT-rotated 4-bit, V at Q8_0.
@@ -15437,7 +15441,7 @@ impl Gpu {
             }
         }
         // V: standard Q8_0 (same as asym4)
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim, 0)
     }
 
     /// Fused K+V write for asym3: K at 3-bit rotated (RotorQuant "planar3"), V at Q8_0.
@@ -15485,7 +15489,7 @@ impl Gpu {
                 )?;
             }
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim, 0)
     }
 
     /// Fused K+V write for fwht3: K at signed-FWHT-256 rotated 3-bit, V at Q8_0.
@@ -15528,7 +15532,7 @@ impl Gpu {
                 )?;
             }
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim, 0)
     }
 
     /// Shared helper: launch a batched K-only rotated write kernel.
@@ -16407,7 +16411,7 @@ impl Gpu {
                 )?;
             }
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim, 0)
     }
 
     /// Fused K+V write for fwht2: K at FWHT-rotated 2-bit, V at Q8_0.
@@ -16449,7 +16453,7 @@ impl Gpu {
                 )?;
             }
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim, 0)
     }
 
     /// Flash attention for asym4 KV (K at rotated 4-bit, V at Q8_0 normal space).

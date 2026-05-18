@@ -1286,8 +1286,8 @@ fn sliding_layer_decode(
             config.sliding_window as u32,
         )?;
     } else if kv_cache.quant_q8 {
-        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim)?;
-        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim)?;
+        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim, 0)?;
+        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim, 0)?;
         gpu.attention_flash_q8_0_window(
             &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.attn_out, &scratch.pos_buf, pos + 1,

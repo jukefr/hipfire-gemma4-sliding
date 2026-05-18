@@ -2359,8 +2359,8 @@ pub fn forward_scratch_layers(
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
             )?;
         } else if kv_cache.quantized && kv_cache.quant_q8 {
-            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim, 0)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim, 0)?;
             gpu.attention_q8_0_kv(
                 &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
@@ -2476,8 +2476,8 @@ pub fn forward_early_exit(
 
         // KV write + attention (use same dispatch as forward_scratch_layers)
         if kv_cache.quantized && kv_cache.quant_q8 {
-            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim, 0)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim, 0)?;
             gpu.attention_q8_0_kv(
                 &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
@@ -2616,8 +2616,8 @@ pub fn forward_scratch_compute(
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
             )?;
         } else if kv_cache.quantized && kv_cache.quant_q8 {
-            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim, 0)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim, 0)?;
             gpu.attention_q8_0_kv(
                 &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
