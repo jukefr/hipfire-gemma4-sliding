@@ -16318,25 +16318,39 @@ impl Gpu {
         }
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
-        let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
+        // max_tiles is the per-head stride into the partials buffer; it must
+        // be (a) >= the number of tiles we actually launch, and (b) such that
+        // n_heads * max_tiles * (2 + head_dim) fits in `partials`. Under ring
+        // buffer mode, kv_cache.max_seq describes the cache slot count (e.g.
+        // 1024) but seq_len_hint can grow beyond it, so we can't derive
+        // max_tiles from `max_seq` alone. Use the partials buffer capacity
+        // to set the stride and validate seq_len_hint fits.
+        let stride = 2 + head_dim;
+        let max_tiles_partials = partials.numel() / (n_heads * stride);
+        let max_tiles_cache = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
+        let max_tiles = max_tiles_partials.max(max_tiles_cache);
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+        if actual_tiles > max_tiles {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "attention_flash_asym3_window: seq_len_hint={} needs {} tiles but \
+                 partials buffer ({} floats / {} per-head stride / {} heads = {} \
+                 tiles) is too small. Increase HIPFIRE_KV_SEQ (for Gemma 4) so the \
+                 scratch partials buffer covers your max expected sequence length.",
+                seq_len_hint, actual_tiles, partials.numel(), stride, n_heads,
+                max_tiles_partials
+            )));
+        }
         let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
 
-        // Guard against partials overflow. The kernel computes per-tile offsets
-        // as `(h * max_tiles + tile_id) * (2 + head_dim)`, so any caller whose
-        // `max_seq` translates to more tiles than the partials buffer can hold
-        // will silently corrupt past the end. For hd=512 this stride is 514,
-        // so the headroom is half what hd=256 callers see — failure surfaces
-        // first on Gemma 4 full layers. Bail loud here.
-        let required_partials = n_heads * max_tiles * (2 + head_dim);
+        // Final overflow guard (defense-in-depth — max_tiles is bounded above
+        // by partials capacity by construction).
+        let required_partials = n_heads * max_tiles * stride;
         if partials.numel() < required_partials {
             return Err(hip_bridge::HipError::new(0, &format!(
                 "attention_flash_asym3_window: partials too small — have {} floats, need {} \
-                 (n_heads={} max_tiles={} stride={} from max_seq={} head_dim={}). \
-                 Resize the per-arch scratch (HIPFIRE_KV_SEQ for Gemma 4) or reduce \
-                 kv_cache.max_seq.",
+                 (n_heads={} max_tiles={} stride={} head_dim={}).",
                 partials.numel(), required_partials,
-                n_heads, max_tiles, 2 + head_dim, max_seq, head_dim
+                n_heads, max_tiles, stride, head_dim
             )));
         }
 
