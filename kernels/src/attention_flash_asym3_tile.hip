@@ -38,7 +38,11 @@ __global__ void attention_flash_asym3_tile(
     // Sliding-window lookback (Gemma 4). 0 = no window / full causal.
     // When > 0, only positions t in [seq_len - window_size, seq_len - 1]
     // contribute; tokens older than that get a -inf score (exp(x-max)=0).
-    int window_size
+    int window_size,
+    // Ring-buffer cache capacity. 0 = no wrap; slot indexing uses t directly.
+    // > 0: slot = t % cache_capacity. Paired with the matching write kernel's
+    // cache_capacity parameter so writes and reads agree on slot mapping.
+    int cache_capacity
 ) {
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
@@ -99,7 +103,8 @@ __global__ void attention_flash_asym3_tile(
         const bool out_of_window = (window_size > 0) && (t < t_lo);
         float partial = 0.0f;
         if (!out_of_window) {
-            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+            const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+            const unsigned char* kb = k_cache + (size_t)k_slot * k_bytes_per_pos + k_head_off;
             float cnorm = *(const float*)kb;
             const unsigned char* base = kb + 4 + tid * 3;
             unsigned int packed = (unsigned int)base[0]
@@ -149,7 +154,8 @@ __global__ void attention_flash_asym3_tile(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+        const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int d = d0 + i;
