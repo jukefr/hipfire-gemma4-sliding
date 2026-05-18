@@ -1249,16 +1249,22 @@ fn sliding_layer_decode(
     if kv_cache.quant_asym3 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
+        // Ring-buffer cache_capacity = sliding_window: writes wrap into a
+        // sliding_window-sized cache; reads address slots via (t % cap). This
+        // lets the sliding KV cache stay at constant size regardless of seq
+        // length — required to fit 128k context on a 17 GB GPU.
+        let sliding_cap = config.sliding_window as u32;
         gpu.kv_cache_write_asym3_fused(
             &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim, 0)?;
+            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim,
+            sliding_cap)?;
         gpu.attention_flash_asym3_window(
             &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
-            config.sliding_window as u32,
-            0,
+            sliding_cap,
+            sliding_cap,
         )?;
     } else if kv_cache.quant_asym4 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();

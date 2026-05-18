@@ -12,8 +12,8 @@
 //!   HIPFIRE_SMOKE_STEPS=8     — greedy-decode N extra tokens after prefill
 //!   HIPFIRE_SMOKE_PROMPT=Hi   — custom raw prompt (no chat template yet)
 //!   HIPFIRE_SMOKE_KV=asym3    — KV cache quant: asym3 (default) / asym4 / asym2 / q8
-//!   HIPFIRE_SMOKE_KV_SEQ=512  — per-cache max seq (full layers)
-//!                                (sliding cache is capped at sliding_window=1024)
+//!   HIPFIRE_SMOKE_KV_SEQ=512  — per-cache max seq (full layers only;
+//!                                sliding asym3 ring-buffers at sliding_window)
 //!
 //! 2026-05-07 (post-rebase): sliding-window kernel diff has been
 //! forward-ported (kernels/src/attention_flash_*_tile{,_batched}.hip
@@ -62,16 +62,24 @@ fn main() {
     let kv_seq = std::env::var("HIPFIRE_SMOKE_KV_SEQ")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(256usize);
     let kv_mode = std::env::var("HIPFIRE_SMOKE_KV").unwrap_or_else(|_| "asym3".to_string());
-    // Sliding cache must hold every written position (write kernel addresses
-    // absolute pos); sliding_window only gates the *read* side. Full KV is
-    // forced to FP32 because the quantized flash kernels truncate head_dim>256.
-    eprintln!("KV cache: sliding={kv_mode} @ {kv_seq} / full=fp32 @ {kv_seq}");
+    // Sliding cache is sized at sliding_window slots (ring-buffer). The write
+    // kernel maps slot = pos % cache_capacity, and the read kernel addresses
+    // the same slot mapping. asym3 sliding path is ring-buffer-aware; other
+    // sliding KV modes are not yet patched and need kv_seq slots.
+    let sliding_kv_seq = if kv_mode == "asym3" {
+        config.sliding_window
+    } else {
+        kv_seq
+    };
+    // Full KV is forced to FP32 because the quantized flash kernels truncate head_dim>256.
+    eprintln!("KV cache: sliding={kv_mode} @ {sliding_kv_seq} (window={}) / full=fp32 @ {kv_seq}",
+        config.sliding_window);
 
     let mut kv_sliding = match kv_mode.as_str() {
-        "asym4" => KvCache::new_gpu_asym4(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
-        "asym2" => KvCache::new_gpu_asym2(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
-        "q8"    => KvCache::new_gpu_q8(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
-        _       => KvCache::new_gpu_asym3(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, kv_seq),
+        "asym4" => KvCache::new_gpu_asym4(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_kv_seq),
+        "asym2" => KvCache::new_gpu_asym2(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_kv_seq),
+        "q8"    => KvCache::new_gpu_q8(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_kv_seq),
+        _       => KvCache::new_gpu_asym3(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_kv_seq),
     }.expect("kv sliding alloc");
     let mut kv_full = KvCache::new_gpu(&mut gpu, n_full, config.full_n_kv_heads, config.full_head_dim, kv_seq)
         .expect("kv full alloc");
