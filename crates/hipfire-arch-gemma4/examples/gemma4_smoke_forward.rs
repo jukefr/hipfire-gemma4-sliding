@@ -135,15 +135,22 @@ fn main() {
         eprintln!("  softcap check: |logit| <= {cap} — PASS");
     }
 
-    // Top-5 argmax.
+    // Top-5 argmax + full sort to compute ranks of arbitrary probe tokens.
     let mut indexed: Vec<(u32, f32)> = logits.iter().enumerate()
         .map(|(i, &v)| (i as u32, v)).collect();
-    indexed.select_nth_unstable_by(4, |a, b| b.1.partial_cmp(&a.1).unwrap());
-    indexed[..5].sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    eprintln!("  top-5 tokens: {:?}", &indexed[..5]);
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    eprintln!("  top-10 tokens: {:?}", &indexed[..10]);
     let argmax = indexed[0].0;
     eprintln!("  argmax = {argmax}  decoded = '{}'  (elapsed: {:?})",
         tokenizer.decode(&[argmax]).replace('\n', "\\n"), elapsed);
+    if let Ok(probe) = std::env::var("HIPFIRE_PROBE_TOKEN") {
+        if let Ok(pid) = probe.parse::<u32>() {
+            let rank = indexed.iter().position(|(i, _)| *i == pid).unwrap_or(usize::MAX);
+            let logit = logits.get(pid as usize).copied().unwrap_or(f32::NAN);
+            eprintln!("  PROBE token {pid} decoded='{}' rank={} logit={:.4}",
+                tokenizer.decode(&[pid]).replace('\n', "\\n"), rank, logit);
+        }
+    }
 
     if n_steps > 1 {
         eprintln!("\n=== decoding {} more tokens greedily ===", n_steps - 1);
