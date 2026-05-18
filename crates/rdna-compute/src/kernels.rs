@@ -477,6 +477,14 @@ pub const GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g128_moe_down_residual_scaled_k8_indexed.hip");
 
+/// N-batched HFQ4G128 indexed MoE down. Grid = (M, K_TOP, N); one block
+/// per (output_row, krank, token) triple. Pairs with the HFQ4G256
+/// batched gate_up to lift prefill MoE from N per-token launches to one
+/// launch per layer. Per_expert_scale stays a separate device input
+/// since Gemma 4 doesn't fold it into topk_weights at top-K renorm.
+pub const GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched.hip");
+
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
 /// layer; one workgroup per token. Enables batched MoE prefill.

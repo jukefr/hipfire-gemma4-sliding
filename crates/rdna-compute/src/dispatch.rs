@@ -9259,6 +9259,61 @@ impl Gpu {
         )
     }
 
+    /// Batched HFQ4G128 indexed MoE down. Grid (M, K_TOP, N); one block
+    /// per (row, krank, token). Pairs with the HFQ4G256 batched gate_up
+    /// (Gemma 4 26B-A4B-it has gate_up=MQ4G256 which shares HFQ4G256's
+    /// inner loop after pre-rotation, and down=HFQ4G128).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize, k: usize, k_top: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched",
+            kernels::GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_BATCHED_SRC,
+            "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched",
+        )?;
+        let pp   = expert_ptrs.buf.as_ptr();
+        let ip   = topk_indices.buf.as_ptr();
+        let wp   = topk_weights.buf.as_ptr();
+        let pesp = per_expert_scale.buf.as_ptr();
+        let hbp  = hidden_batch.buf.as_ptr();
+        let xrp  = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp   as *const _ as *mut c_void,
+            &ip   as *const _ as *mut c_void,
+            &wp   as *const _ as *mut c_void,
+            &pesp as *const _ as *mut c_void,
+            &hbp  as *const _ as *mut c_void,
+            &xrp  as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let func_name = "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched";
+        self.launch_maybe_blob(
+            func_name,
+            [m as u32, k_top as u32, batch_size as u32], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(wp);
+                b.push_ptr(pesp); b.push_ptr(hbp); b.push_ptr(xrp);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
     /// Gemma 4 MoE gate_up MQ4G256/MG4G256 indexed dispatch. The MQ4 GEMV
     /// inner loop is byte-identical to HFQ4G256's (same 136 B groups);
     /// the only difference is the caller pre-rotates x via FWHT once
