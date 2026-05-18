@@ -6138,7 +6138,7 @@ fn run_fa_layer_body(
         } else {
             gpu.kv_cache_write_asym3_fused(
                 &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim, 0)?;
             gpu.attention_flash_asym3(
                 &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
@@ -6716,7 +6716,7 @@ fn forward_scratch_layers(
                     } else {
                         gpu.kv_cache_write_asym3_fused(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim, 0)?;
                         gpu.attention_flash_asym3(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
@@ -7107,7 +7107,7 @@ fn forward_scratch_layers(
                     } else {
                         gpu.kv_cache_write_asym3_fused(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim, 0)?;
                         gpu.attention_flash_asym3(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
@@ -7477,7 +7477,7 @@ fn forward_scratch_layers_multi(
                         } else {
                             gpu.kv_cache_write_asym3_fused(
                                 &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim, 0)?;
                             gpu.attention_flash_asym3(
                                 &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                                 &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
@@ -7758,7 +7758,7 @@ fn forward_scratch_layers_multi(
                         } else {
                             gpu.kv_cache_write_asym3_fused(
                                 &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim, 0)?;
                             gpu.attention_flash_asym3(
                                 &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                                 &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,

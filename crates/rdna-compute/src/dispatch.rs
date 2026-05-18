@@ -15453,8 +15453,20 @@ impl Gpu {
         k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize,
+        // Ring-buffer cache capacity. 0 = no wrap (slot = pos directly).
+        // > 0: slot = pos % cache_capacity. Used for sliding-window KV.
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // hd=512 (full-attention) variant does NOT yet plumb cache_capacity
+        // through the kv_cache_write_asym_k_givens3_hd512 kernel. Reject loudly
+        // so a future caller doesn't silently get direct addressing when they
+        // asked for ring buffer.
+        if head_dim == 512 && cache_capacity > 0 {
+            return Err(hip_bridge::HipError::new(0,
+                "kv_cache_write_asym3_fused: ring buffer (cache_capacity>0) only \
+                 supported on head_dim=256 today. hd=512 kernel needs the same patch."));
+        }
         let (kernel_name, kernel_src) = match head_dim {
             256 => ("kv_cache_write_asym_k_givens3", kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC),
             512 => ("kv_cache_write_asym_k_givens3_hd512", kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC),
@@ -15463,7 +15475,36 @@ impl Gpu {
             ))),
         };
         self.ensure_givens4_kernel(kernel_name, kernel_src, kernel_name)?;
-        {
+        if head_dim == 256 {
+            // hd=256 K-write kernel takes cache_capacity (8 args).
+            let func = &self.functions[kernel_name];
+            let mut kdp = k_dst.buf.as_ptr();
+            let mut ksp = k_src.buf.as_ptr();
+            let mut pp = pos_buf.as_ptr();
+            let mut ctp = cos_theta.buf.as_ptr();
+            let mut stp = sin_theta.buf.as_ptr();
+            let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut cap = cache_capacity as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut kdp as *mut _ as *mut c_void,
+                &mut ksp as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void,
+                &mut ctp as *mut _ as *mut c_void,
+                &mut stp as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut cap as *mut _ as *mut c_void,
+            ];
+            let shared_mem = ((head_dim + 32) * 4) as u32;
+            unsafe {
+                self.hip.launch_kernel(
+                    func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
+                    self.stream_ref(), &mut params,
+                )?;
+            }
+        } else {
+            // hd=512 K-write kernel still has original 7-arg signature.
             let func = &self.functions[kernel_name];
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
@@ -15489,7 +15530,7 @@ impl Gpu {
                 )?;
             }
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim, 0)
+        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim, cache_capacity)
     }
 
     /// Fused K+V write for fwht3: K at signed-FWHT-256 rotated 3-bit, V at Q8_0.
