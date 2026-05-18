@@ -3219,13 +3219,100 @@ fn generate_multi(
     let _ = stdout.flush();
 }
 
+/// Build a Gemma 4 native prompt scaffold using the model's actual special
+/// tokens. Output starts with BOS, may include a tool definitions block in
+/// `<|tool>...<tool|>`, walks the conversation history (or synthesizes a
+/// single user turn from the legacy `prompt`/`system` fields) wrapped in
+/// `<|turn>role\n…<turn|>\n`, and ends primed for assistant generation with
+/// `<|turn>model\n`. Assistant tool_calls in the history are emitted as
+/// `<|tool_call>call:NAME{ARGS_JSON}<tool_call|>` per the Gemma 4 schema.
+fn gemma4_build_scaffold(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    bos: u32,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) -> Vec<u32> {
+    let mut text = String::new();
+    // Tools block — declared once at the top of the conversation.
+    if let Some(t) = tools {
+        if !t.is_empty() {
+            text.push_str("<|tool>");
+            // Pretty-printed JSON keeps the model's expectations consistent with
+            // the upstream Gemma 4 training format (the response_schema regex
+            // expects JSON objects per function).
+            text.push_str(&serde_json::to_string_pretty(&t).unwrap_or_else(|_| "[]".into()));
+            text.push_str("<tool|>\n");
+        }
+    }
+    // Conversation — multi-turn if provided, else synthesize a single user turn.
+    if let Some(msgs) = messages_history {
+        for msg in msgs {
+            use hipfire_runtime::prompt_frame::Role;
+            let role_name = match msg.role {
+                Role::System => "user", // splice system content into a user turn
+                Role::User => "user",
+                Role::Assistant => "model",
+                Role::Tool => "tool",
+            };
+            text.push_str("<|turn>");
+            text.push_str(role_name);
+            text.push('\n');
+            // System messages render as part of the first user turn body.
+            if matches!(msg.role, Role::System) {
+                text.push_str(&msg.content);
+                text.push_str("\n\n");
+                text.push_str("<turn|>\n");
+                continue;
+            }
+            // Assistant tool_calls -> <|tool_call>call:NAME{ARGS}<tool_call|>
+            for tc in &msg.tool_calls {
+                text.push_str("<|tool_call>call:");
+                text.push_str(&tc.name);
+                text.push_str(&serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".into()));
+                text.push_str("<tool_call|>");
+            }
+            if matches!(msg.role, Role::Tool) {
+                // Tool result content gets wrapped in <|tool_response>...<tool_response|>.
+                text.push_str("<|tool_response>");
+                text.push_str(&msg.content);
+                text.push_str("<tool_response|>");
+            } else {
+                text.push_str(&msg.content);
+            }
+            text.push_str("<turn|>\n");
+        }
+    } else {
+        // Legacy single-turn path: combine optional system into the user turn body.
+        let user_text = match system_prompt {
+            Some(sp) if !sp.is_empty() => format!("{sp}\n\n{prompt}"),
+            _ => prompt.to_string(),
+        };
+        text.push_str("<|turn>user\n");
+        text.push_str(&user_text);
+        text.push_str("<turn|>\n");
+    }
+    // Prime the model for an assistant response.
+    text.push_str("<|turn>model\n");
+
+    let mut tokens: Vec<u32> = vec![bos];
+    tokens.extend(tokenizer.encode(&text));
+    tokens
+}
+
 /// Minimal AR generate path for Gemma 4 (arch_id=7).
 ///
 /// Mirrors `gemma4_smoke_forward`'s per-token loop but emits JSON `token` /
-/// `done` events on stdout instead of debug prints. No DFlash, no eviction,
-/// no multi-GPU, no PFlash. Uses Gemma's ChatML scaffold
-/// (`<start_of_turn>user / model<end_of_turn>`) and stops on `<end_of_turn>`
-/// or `config.eos_token`.
+/// `done` events on stdout instead of debug prints. Supports OpenAI-style
+/// `tools` + `messages` history via the HF chat template (rendered through
+/// `JinjaChatFrame` with `bos_token=Some("<bos>")` for Gemma 4's special
+/// BOS handling). No DFlash, no eviction, no multi-GPU, no PFlash.
+///
+/// Multi-turn caching across requests is not yet implemented; when
+/// `messages_history` is provided (or `HIPFIRE_JINJA_CHAT=1`), the daemon
+/// resets `seq_pos` and re-prefills the full conversation each turn. The
+/// ring-buffer sliding KV cache makes this cheap (~50 tok/s prefill).
 #[allow(clippy::too_many_arguments)]
 fn generate_gemma4(
     m: &mut LoadedModel,
@@ -3239,6 +3326,8 @@ fn generate_gemma4(
     max_tokens: usize,
     repeat_penalty: f32,
     repeat_window: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     let t0 = Instant::now();
     let tokenizer = m.tokenizer.as_ref().unwrap();
@@ -3246,19 +3335,83 @@ fn generate_gemma4(
     let weights = m.gemma4_weights.as_ref().unwrap();
     let scratch = m.gemma4_scratch.as_ref().unwrap();
 
-    // Build the ChatML-wrapped prompt. Gemma 4 doesn't have a system role —
-    // splice the system text into the user turn if provided.
-    let user_text = match system_prompt {
-        Some(sp) if !sp.is_empty() => format!("{sp}\n\n{prompt}"),
-        _ => prompt.to_string(),
-    };
-    let scaffolded = format!(
-        "<start_of_turn>user\n{user_text}<end_of_turn>\n<start_of_turn>model\n"
-    );
+    // Decide whether to render via the HF chat template. Use Jinja when
+    // structured tools/messages are provided OR the operator opts in via
+    // HIPFIRE_JINJA_CHAT=1 AND a chat_template was extracted at load time.
+    let jinja_env = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let has_structured = tools.is_some() || messages_history.is_some();
+    let try_jinja = (has_structured || jinja_env) && m.chat_template.is_some();
 
-    // BOS + scaffold tokens. HF's Gemma 4 tokenizer always prepends `<bos>`.
-    let mut prompt_tokens: Vec<u32> = vec![config.bos_token];
-    prompt_tokens.extend(tokenizer.encode(&scaffolded));
+    // Multi-turn via Jinja re-prefills the full history each request — reset
+    // KV state before encoding. Single-turn prompts (no messages_history)
+    // continue to append to conversation_tokens for cross-turn caching.
+    let multi_turn_reset = try_jinja && has_structured;
+    if multi_turn_reset {
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        if let Some(kv) = m.gemma4_kv_sliding.as_mut() { kv.compact_offset = 0; }
+        if let Some(kv) = m.gemma4_kv_full.as_mut() { kv.compact_offset = 0; }
+    }
+
+    let prompt_tokens: Vec<u32> = if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: false, // Gemma 4 doesn't use Qwen-style <think> blocks
+            // Gemma 4 BOS quirk: bos_id=2 decodes to LLaMA-cosmetic '<s>' but
+            // the template emits literal '<bos>' which retokenizes to id=2.
+            bos_token: Some("<bos>"),
+        };
+        let render_result = if has_structured {
+            // Use provided messages, or synthesize [system?, user] from the
+            // legacy fields if only `tools` was provided.
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(m) => m,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] gemma4 jinja render failed ({e}) — falling back to native scaffold");
+                gemma4_build_scaffold(tokenizer, config.bos_token, system_prompt, prompt,
+                                       tools, messages_history)
+            }
+        }
+    } else {
+        // No chat_template available — use the native Gemma 4 scaffold built
+        // from the model's actual special tokens (<|turn>, <|tool>, <|tool_call>,
+        // <|tool_response>, <|channel>) as documented in the tokenizer
+        // metadata. The legacy `<start_of_turn>` literal-text format is wrong
+        // for Gemma 4 — that scheme is from Gemma 2/3, not this Gemma 4 build.
+        gemma4_build_scaffold(tokenizer, config.bos_token, system_prompt, prompt,
+                               tools, messages_history)
+    };
 
     // Reset on overflow. Full-context KV is at max_seq slots; sliding ring-
     // buffers don't need this guard.
@@ -3272,9 +3425,14 @@ fn generate_gemma4(
         if let Some(kv) = m.gemma4_kv_full.as_mut() { kv.compact_offset = 0; }
     }
 
-    // Optional end-of-turn token. Falls back to config.eos_token alone if the
-    // tokenizer doesn't register `<end_of_turn>` as a special.
-    let eot_id = tokenizer.special_token_id("<end_of_turn>");
+    // Gemma 4's training EOS marker is `<turn|>` (id 106 in this build); the
+    // tokenizer's generic eos parser only knows about Qwen/GPT-2 conventions
+    // and doesn't tag this, so check both explicitly. `<eos>` (id 1) is also
+    // a valid stop per config.eos_token_id=[1,106] in the metadata.
+    let eot_id = tokenizer.special_token_id("<turn|>");
+    // Also probe alternate spellings just in case a different Gemma 4 build
+    // ships <end_of_turn> as a literal special.
+    let alt_eot = tokenizer.special_token_id("<end_of_turn>");
 
     // Prefill — per-token forward into both KV caches.
     let kv_sliding = m.gemma4_kv_sliding.as_mut().expect("gemma4 kv_sliding");
@@ -3324,6 +3482,7 @@ fn generate_gemma4(
         // Terminator?
         if next_token == config.eos_token { break; }
         if eot_id == Some(next_token) { break; }
+        if alt_eot == Some(next_token) { break; }
         if tokenizer.is_terminator(next_token) { break; }
 
         // Commit + stream the token text.
@@ -3391,13 +3550,15 @@ fn generate_gemma4(
 
 #[allow(clippy::too_many_arguments)]
 fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
-    // Gemma 4 dispatch — minimal AR path, no DFlash/multi-GPU/PFlash/tools.
-    // Silently ignores qwen-specific knobs (budgets, think-cap, tools history).
+    // Gemma 4 dispatch — minimal AR path, no DFlash/multi-GPU/PFlash.
+    // Honors tools + messages_history via JinjaChatFrame; silently ignores
+    // qwen-specific knobs (think-cap, assistant_prefix, pflash, budget alerts).
     if m.arch_id == 7 {
         let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens, assistant_prefix,
-                 pflash_state, pflash_cfg, tools, messages_history);
+                 pflash_state, pflash_cfg);
         generate_gemma4(m, gpu, stdout, id, prompt, system_prompt, temp, top_p,
-                        max_tokens, repeat_penalty, repeat_window);
+                        max_tokens, repeat_penalty, repeat_window,
+                        tools, messages_history);
         return;
     }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
