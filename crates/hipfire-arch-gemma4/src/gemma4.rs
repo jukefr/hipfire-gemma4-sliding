@@ -1123,36 +1123,7 @@ pub fn forward_scratch(
         EmbeddingFormat::F32     => gpu.embedding_lookup(&weights.embed_tokens, &scratch.x, token, dim)?,
         _ => return Err(hip_bridge::HipError::new(0, "unsupported Gemma 4 embed format")),
     }
-    if std::env::var("HIPFIRE_DUMP_PER_LAYER").ok().as_deref() == Some("1") && pos == 0 {
-        let v = gpu.download_f32(&scratch.x)?;
-        let n = v.len();
-        let rms = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64).sqrt();
-        let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
-        let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        eprintln!("[layer-trace] {:<28}  n={n:>5}  rms={rms:>10.6}  min={mn:>+9.6}  max={mx:>+9.6}  first8={:?}",
-            "embed RAW (pre-scale)", &v[..8]);
-    }
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
-
-    // Diagnostic: per-layer scratch.x magnitude trace. HIPFIRE_DUMP_PER_LAYER=1
-    // prints rms / min / max / nonfinite after each layer boundary, plus the
-    // post-embed and post-final-norm magnitudes. Useful for spotting which
-    // layer the hidden state goes out-of-distribution at (e.g. catastrophic
-    // quant noise or a per-layer scalar/op blowing up the magnitude).
-    let dump_per_layer = std::env::var("HIPFIRE_DUMP_PER_LAYER").ok().as_deref() == Some("1")
-        && pos == 0;
-    let dump = |gpu: &mut Gpu, t: &GpuTensor, tag: &str| -> HipResult<()> {
-        if !dump_per_layer { return Ok(()); }
-        let v = gpu.download_f32(t)?;
-        let n = v.len();
-        let rms = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64).sqrt();
-        let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
-        let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let nf = v.iter().filter(|x| !x.is_finite()).count();
-        eprintln!("[layer-trace] {tag:<28}  n={n:>5}  rms={rms:>10.4}  min={mn:>+9.4}  max={mx:>+9.4}  nf={nf}");
-        Ok(())
-    };
-    dump(gpu, &scratch.x, "post-embed*sqrt(dim)")?;
 
     // 2) Update device pos_buf.
     let pos_i32 = pos as i32;
@@ -1176,14 +1147,10 @@ pub fn forward_scratch(
                 &format!("Gemma 4 layer {} type/weights mismatch", layer_idx),
             )),
         }
-        dump(gpu, &scratch.x, &format!("layer{:02} {:?} done", layer_idx, layer_type))?;
     }
 
     // 4) Final RMSNorm.
-    dump(gpu, &weights.final_norm, "WEIGHT final_norm")?;
-    dump(gpu, &scratch.x, "pre-final-norm x")?;
     gpu.rmsnorm_f32(&scratch.x, &weights.final_norm, &scratch.tmp, config.norm_eps)?;
-    dump(gpu, &scratch.tmp, "post-final-norm")?;
 
     // 5) LM head → logits (reads tied embed bytes via lm_head.buf alias).
     weight_gemv(gpu, &weights.lm_head, &scratch.tmp, &scratch.logits)?;
@@ -1246,48 +1213,16 @@ fn sliding_layer_decode(
     let n_kv = config.sliding_n_kv_heads;
     let dim_bytes = dim * 4;
 
-    // Layer-0 internal trace (HIPFIRE_DUMP_LAYER0_INTERNAL=1, decode-step pos==0 only).
-    let dump_layer0 = std::env::var("HIPFIRE_DUMP_LAYER0_INTERNAL").ok().as_deref() == Some("1")
-        && pos == 0 && kv_layer_idx == 0;
-    // Take a slice count so we only read the LIVE portion of buffers that are
-    // sized for max(sliding,full). e.g. scratch.q is sized 8192 (full) but
-    // sliding uses only 4096 — reading the whole buffer dilutes rms by sqrt(2).
-    let stat_n = |gpu: &mut Gpu, t: &GpuTensor, tag: &str, n_live: usize| -> HipResult<()> {
-        if !dump_layer0 { return Ok(()); }
-        let v = gpu.download_f32(t)?;
-        let n_live = n_live.min(v.len());
-        let live = &v[..n_live];
-        let rms = (live.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n_live as f64).sqrt();
-        let mn = live.iter().cloned().fold(f32::INFINITY, f32::min);
-        let mx = live.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let nf = live.iter().filter(|x| !x.is_finite()).count();
-        eprintln!("[L0] {tag:<28}  n={n_live:>5}  rms={rms:>10.4}  min={mn:>+9.4}  max={mx:>+9.4}  nf={nf}");
-        Ok(())
-    };
-    let stat = |gpu: &mut Gpu, t: &GpuTensor, tag: &str| -> HipResult<()> {
-        stat_n(gpu, t, tag, usize::MAX)
-    };
-    let q_live = n_heads * head_dim;
-    let kv_live = n_kv * head_dim;
-    stat(gpu, &scratch.x, "L0/in x (post-embed)")?;
-    stat(gpu, &lw.q_norm, "L0/WEIGHT q_norm")?;
-    stat(gpu, &lw.k_norm, "L0/WEIGHT k_norm")?;
-    stat(gpu, &lw.input_layernorm, "L0/WEIGHT input_layernorm")?;
-
     // residual = x
     gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
 
     // tmp = input_layernorm(x)
     gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
-    stat(gpu, &scratch.tmp, "L0/post-input_layernorm")?;
 
     // Q/K/V projections: q[n_heads*head_dim], k/v[n_kv*head_dim].
     weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
     weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
     weight_gemv(gpu, &lw.v_proj, &scratch.tmp, &scratch.v)?;
-    stat_n(gpu, &scratch.q, "L0/Q post-proj", q_live)?;
-    stat_n(gpu, &scratch.k, "L0/K post-proj", kv_live)?;
-    stat_n(gpu, &scratch.v, "L0/V post-proj", kv_live)?;
 
     // q_norm + k_norm + no-scale v_norm across head_dim (in-place).
     // v_norm matches HF Gemma 4 `value_states = v_norm(v_proj(x))` (no_scale=True
@@ -1299,9 +1234,6 @@ fn sliding_layer_decode(
     gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
     gpu.rmsnorm_batched(&scratch.v, &scratch.v_norm_ones_full, &scratch.v,
         n_kv, head_dim, config.norm_eps)?;
-    stat_n(gpu, &scratch.q, "L0/Q post-q_norm", q_live)?;
-    stat_n(gpu, &scratch.k, "L0/K post-k_norm", kv_live)?;
-    stat_n(gpu, &scratch.v, "L0/V post-v_norm", kv_live)?;
 
     // Pre-scale Q by sqrt(head_dim) so the flash-attn kernel's internal
     // 1/sqrt(head_dim) cancels, leaving the effective Gemma 4 scale of 1.0.
@@ -1311,8 +1243,6 @@ fn sliding_layer_decode(
     // Full rotate_half RoPE, theta=10000, head_dim=256 (all dims rotate).
     gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
         n_heads, n_kv, head_dim, config.sliding_rope_theta)?;
-    stat_n(gpu, &scratch.q, "L0/Q post-rope (×√hd)", q_live)?;
-    stat_n(gpu, &scratch.k, "L0/K post-rope", kv_live)?;
 
     // KV cache write + flash attention with window_size=1024.
     // Branch on cache quant mode, same as qwen35::run_fa_layer_body.
@@ -1378,54 +1308,28 @@ fn sliding_layer_decode(
         ));
     }
 
-    stat_n(gpu, &scratch.attn_out, "L0/attn_out (after FA)", q_live)?;
-
     // o_proj → tmp (reuse tmp, overwriting input_layernorm output).
     weight_gemv(gpu, &lw.o_proj, &scratch.attn_out, &scratch.tmp)?;
-    stat(gpu, &scratch.tmp, "L0/tmp post-o_proj")?;
 
     // Sandwich post-attn norm (in-place on tmp).
     gpu.rmsnorm_f32(&scratch.tmp, &lw.post_attention_layernorm, &scratch.tmp, config.norm_eps)?;
-    stat(gpu, &scratch.tmp, "L0/tmp post-attn-norm")?;
 
     // x = residual + tmp. (Reset x first since earlier ops mutated it.)
     gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
     gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
-    stat(gpu, &scratch.x, "L0/x post-attn-residual")?;
 
     // residual = x (for the FFN residual stream).
     gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
 
     // Pre-FFN norm.
     gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
-    stat(gpu, &scratch.tmp, "L0/tmp post-pre-ffn-norm")?;
 
     // SwiGLU(gelu_pytorch_tanh): gate_proj, up_proj, gelu_tanh(gate) * up → down_proj.
     weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
     weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
-    stat_n(gpu, &scratch.gate_ffn, "L0/gate post-gate_proj", config.hidden_dim)?;
-    stat_n(gpu, &scratch.up_ffn, "L0/up post-up_proj", config.hidden_dim)?;
     gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, config.hidden_dim)?;
-    stat_n(gpu, &scratch.ffn_hidden, "L0/gelu(gate)", config.hidden_dim)?;
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
-    stat_n(gpu, &scratch.ffn_hidden, "L0/gelu(gate)*up", config.hidden_dim)?;
-    if dump_layer0 {
-        let v = gpu.download_f32(&scratch.ffn_hidden)?;
-        let live: &[f32] = &v[..config.hidden_dim];
-        let bytes = unsafe { std::slice::from_raw_parts(live.as_ptr() as *const u8, live.len() * 4) };
-        std::fs::write("/tmp/hipfire_ffn_hidden.bin", bytes).ok();
-    }
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
-    stat(gpu, &scratch.ffn_out, "L0/ffn_out post-down")?;
-    if dump_layer0 {
-        let v = gpu.download_f32(&scratch.ffn_out)?;
-        let first8: Vec<f32> = v[..8].to_vec();
-        eprintln!("[L0] L0/ffn_out first 8: {:?}", first8);
-        // Dump to file for cross-comparison with REF.
-        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
-        std::fs::write("/tmp/hipfire_ffn_out.bin", bytes).ok();
-        eprintln!("[L0] L0/ffn_out: wrote /tmp/hipfire_ffn_out.bin ({} floats)", v.len());
-    }
 
     // Sandwich post-FFN norm. On MoE layers (26B-A4B) this is folded into
     // apply_moe_branch (which adds the parallel MoE branch + sandwich norms
