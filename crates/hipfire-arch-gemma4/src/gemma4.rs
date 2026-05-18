@@ -1150,7 +1150,11 @@ fn apply_moe_branch(
             &scratch.moe_expert_hidden_batch)?;
 
         // Zero accumulator (memset is sync but tiny — 11 KB for dim=2816).
-        gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
+        if let Some(s) = gpu.active_stream.as_ref() {
+            gpu.hip.memset_async(&scratch.moe_cur_moe.buf, 0, dim_bytes, s)?;
+        } else {
+            gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
+        }
 
         // Indexed down + scaled residual: 8 fused GEMVs, atomicAdd into
         // moe_cur_moe with scale = topk_weights[krank] *
@@ -1195,7 +1199,11 @@ fn apply_moe_branch(
                 ));
             }
         }
-        gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
+        if let Some(s) = gpu.active_stream.as_ref() {
+            gpu.hip.memset_async(&scratch.moe_cur_moe.buf, 0, dim_bytes, s)?;
+        } else {
+            gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
+        }
         for ki in 0..k_top {
             let e = topk_indices[ki];
             let weight = topk_weights[ki] * moe.per_expert_scale_host[e];
@@ -1241,10 +1249,10 @@ pub fn forward_scratch(
     let dim = config.dim;
 
     // 1) Embedding lookup + sqrt(dim) scale.
-    //
-    // Gemma 4 multiplies the embedding row by sqrt(hidden_size) (bf16-cast
-    // in the reference — we do it in fp32 here; the absolute magnitude
-    // difference is sub-epsilon for our MQ4 quality target).
+    // ALWAYS direct — the captured graph can't bake in `token` (varies per
+    // call). The embed lookup fills scratch.x; the rest of the forward
+    // (which is graph-capturable now that the MoE branch has no D2H syncs)
+    // reads from scratch.x. Same split Qwen35 uses for its captured path.
     match weights.embd_format {
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.embed_tokens, &scratch.x, token, dim)?,
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.embed_tokens, &scratch.x, token, dim)?,
@@ -1254,10 +1262,86 @@ pub fn forward_scratch(
     }
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
 
-    // 2) Update device pos_buf.
-    let pos_i32 = pos as i32;
-    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    // hipGraph capture/replay policy.
+    //   - DEFAULT-OFF for Gemma 4. The captured graph produces incorrect
+    //     output on the first replay — the model emits multilingual
+    //     gibberish instead of the direct path's clean answer
+    //     ("get own el 싶 kreatif 博文 …" rather than "Paris"). Same class
+    //     of issue as the Qwen35 MoE-graph drift (see qwen35.rs ~3070
+    //     comment block): some kernel in the MoE forward path captures +
+    //     replays with non-bit-identical semantics. Suspected culprit is
+    //     the indexed-down atomicAdd accumulation order across blocks,
+    //     but not yet root-caused.
+    //   - HIPFIRE_GRAPH=1 to opt in for debugging.
+    //   - Compact offset != 0 (TriAttention eviction) also breaks capture
+    //     for the same reason as Qwen35 — bail to direct in that case.
+    static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {
+        match std::env::var("HIPFIRE_GRAPH").ok().as_deref() {
+            Some("0") => Some(false),
+            Some("1") => Some(true),
+            _ => None,
+        }
+    });
+    let use_graph = graph_override.unwrap_or(false)
+        && kv_sliding.compact_offset == 0
+        && kv_full.compact_offset == 0;
 
+    if use_graph && gpu.graph_exec.is_some() {
+        // ── Replay path. Update pos_buf via stream_write_value32 (graph-
+        //    replay-safe, no host→device copy). The captured graph reads
+        //    pos_buf at kernel-launch time, so a fresh `pos` propagates
+        //    without recapture. ──
+        let stream = gpu.active_stream.as_ref().unwrap();
+        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+        gpu.graph_launch()?;
+    } else if use_graph && gpu.graph_exec.is_none() {
+        let pos_i32 = pos as i32;
+        if !gpu.ar_forward_warmed_up {
+            // ── Warmup: direct dispatch so any JIT kernel compiles or lazy
+            //    scratch allocations happen OUTSIDE a capture region.
+            //    Capturing on the first call hits "hipMalloc not permitted
+            //    under stream capture". Same pattern as Qwen35. ──
+            gpu.ar_forward_warmed_up = true;
+            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+            forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
+        } else {
+            // ── First post-warmup call: capture the forward into a graph. ──
+            if gpu.active_stream.is_none() {
+                gpu.active_stream = Some(gpu.hip.stream_create()?);
+            }
+            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+            gpu.begin_graph_capture()?;
+            forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
+            gpu.end_graph_capture()?;
+            // hipStreamCaptureModeGlobal RECORDS — kernels don't execute
+            // during capture. Replay once so THIS pos's forward actually
+            // runs (KV write, logits update).
+            gpu.graph_launch()?;
+            eprintln!("[gemma4 hipGraph] captured {} blobs, instantiated",
+                gpu.capture_blobs.len());
+        }
+    } else {
+        // ── Direct path (no graph) ──
+        let pos_i32 = pos as i32;
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        forward_scratch_inner(gpu, weights, config, pos, kv_sliding, kv_full, scratch)?;
+    }
+    Ok(())
+}
+
+/// Graph-capturable body of `forward_scratch`. Caller is responsible for:
+///   - embed lookup + embed scale (fills scratch.x — varies per call)
+///   - pos_buf update (htod for warmup/capture; stream_write_value32 for replay)
+fn forward_scratch_inner(
+    gpu: &mut Gpu,
+    weights: &Gemma4Weights,
+    config: &Gemma4Config,
+    pos: usize,
+    kv_sliding: &mut hipfire_runtime::llama::KvCache,
+    kv_full: &mut hipfire_runtime::llama::KvCache,
+    scratch: &Gemma4Scratch,
+) -> HipResult<()> {
     // 3) Per-layer forward.
     let mut sliding_kv_idx = 0usize;
     let mut full_kv_idx = 0usize;
@@ -1343,7 +1427,11 @@ fn sliding_layer_decode(
     let dim_bytes = dim * 4;
 
     // residual = x
-    gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.residual.buf, 0, &scratch.x.buf, 0, dim_bytes, s)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+    }
 
     // tmp = input_layernorm(x)
     gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
@@ -1451,11 +1539,19 @@ fn sliding_layer_decode(
     gpu.rmsnorm_f32(&scratch.tmp, &lw.post_attention_layernorm, &scratch.tmp, config.norm_eps)?;
 
     // x = residual + tmp. (Reset x first since earlier ops mutated it.)
-    gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.x.buf, 0, &scratch.residual.buf, 0, dim_bytes, s)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    }
     gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
 
     // residual = x (for the FFN residual stream).
-    gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.residual.buf, 0, &scratch.x.buf, 0, dim_bytes, s)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+    }
 
     // Pre-FFN norm.
     gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
@@ -1480,7 +1576,11 @@ fn sliding_layer_decode(
     }
 
     // x = residual + tmp (again, reset x from saved residual).
-    gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.x.buf, 0, &scratch.residual.buf, 0, dim_bytes, s)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    }
     gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
 
     // Learned per-layer scalar multiplier.
@@ -1527,7 +1627,11 @@ fn full_layer_decode(
     let kv_bytes = n_kv * head_dim * 4;
 
     // residual = x
-    gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.residual.buf, 0, &scratch.x.buf, 0, dim_bytes, s)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+    }
 
     // tmp = input_layernorm(x)
     gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
@@ -1537,7 +1641,11 @@ fn full_layer_decode(
     weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
 
     // CRITICAL: capture pre-k_norm bytes as V before applying k_norm.
-    gpu.hip.memcpy_dtod(&scratch.v.buf, &scratch.k.buf, kv_bytes)?;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.k.buf, 0, kv_bytes, s)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.v.buf, &scratch.k.buf, kv_bytes)?;
+    }
 
     // q_norm, k_norm, and no-scale v_norm (all head_dim = 512).
     gpu.rmsnorm_batched(&scratch.q, &lw.q_norm, &scratch.q, n_heads, head_dim, config.norm_eps)?;
@@ -1604,11 +1712,19 @@ fn full_layer_decode(
     gpu.rmsnorm_f32(&scratch.tmp, &lw.post_attention_layernorm, &scratch.tmp, config.norm_eps)?;
 
     // x = residual + tmp.
-    gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.x.buf, 0, &scratch.residual.buf, 0, dim_bytes, s)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    }
     gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
 
     // Save new residual.
-    gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.residual.buf, 0, &scratch.x.buf, 0, dim_bytes, s)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
+    }
 
     // Pre-FFN norm.
     gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
@@ -1630,7 +1746,11 @@ fn full_layer_decode(
     }
 
     // x = residual + tmp.
-    gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.x.buf, 0, &scratch.residual.buf, 0, dim_bytes, s)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.x.buf, &scratch.residual.buf, dim_bytes)?;
+    }
     gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
 
     // Learned per-layer scalar multiplier.
