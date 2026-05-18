@@ -212,7 +212,18 @@ impl Tokenizer {
             _ => None,
         };
 
-        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
+        // BPE-flavor detection: SentencePiece-style (Gemma, LLaMA) uses `▁`
+        // (U+2581) as the leading-space marker; GPT-2 byte-level (Qwen) uses
+        // `Ġ` (= byte 0x20 mapped through bytes_to_unicode). The prior check
+        // (`Ġthe` || `Ġ`) misidentified Gemma 4 as GPT-2 because Gemma's
+        // vocab includes a single byte-fallback `Ġ` entry (the literal 0x20
+        // byte) alongside 137K `▁`-prefixed SentencePiece tokens. Prefer
+        // SentencePiece evidence — `▁` or `▁the` is a much stronger signal
+        // than a lone `Ġ`. Fall through to GPT-2 only when no `▁` markers
+        // exist at all.
+        let is_gpt2_bpe = !token_to_id.contains_key("▁the")
+            && !token_to_id.contains_key("▁")
+            && (token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ"));
 
         let merge_pair_rank = build_merge_pair_rank(&merges);
 
