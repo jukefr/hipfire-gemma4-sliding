@@ -666,7 +666,7 @@ fn main() {
     if let Some(model_path) = model_env.as_deref() {
         eprintln!("─── Phase 2: weight-dependent kernels (rmsnorm / proj / o_proj / mlp) ─");
         eprintln!("    model: {}", model_path);
-        let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+        let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
         if hfq.arch_id != 7 {
             eprintln!("    ERROR: VERIFY_MODEL is not a Gemma 4 .mq4 (arch_id={}, expected 7)", hfq.arch_id);
             std::process::exit(2);
@@ -676,7 +676,7 @@ fn main() {
                   config.dim, config.n_layers, config.n_heads,
                   config.sliding_head_dim, config.full_head_dim);
         eprintln!("    loading weights (single load shared by Phase 2 + 3)...");
-        let weights = gemma4::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+        let weights = gemma4::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
         eprintln!("    loaded {} layers", weights.layers.len());
 
         for layer_idx in 0..n_layers_dump.min(weights.layers.len() as i32) {

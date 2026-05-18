@@ -39,7 +39,7 @@ fn main() {
         .ok().and_then(|v| v.parse().ok()).unwrap_or(1);
 
     eprintln!("Opening: {model_path}");
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     assert_eq!(hfq.arch_id, 7, "expected arch_id=7 (Gemma 4), got {}", hfq.arch_id);
     let config = gemma4::config_from_hfq(&hfq).expect("read config");
 
@@ -57,7 +57,7 @@ fn main() {
 
     eprintln!("Loading weights...");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = gemma4::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = gemma4::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     let kv_seq = std::env::var("HIPFIRE_SMOKE_KV_SEQ")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(256usize);
