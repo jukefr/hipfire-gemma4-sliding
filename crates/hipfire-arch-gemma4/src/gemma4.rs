@@ -363,7 +363,7 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
-            return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 });
+            return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None });
         }
         3  => DType::Q8_0,
         4  => DType::Q4K,
@@ -381,14 +381,16 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
         18 => DType::MQ2G256,
         // MG4-G256 — Magnum-Gemma 4-bit. Same binary layout as MQ4G256 (136 B/group),
         // differs only in calibration policy at quant time. Alias to MQ4G256 so the
-        // existing GEMV path handles it without a kernel change.
-        19 => DType::MQ4G256,
+        // existing GEMV path handles it without a kernel change. ID was 19 on
+        // origin/gemma4 pre-rebase; reassigned to 30 because master shipped
+        // MQ2G256Lloyd at 19.
+        30 => DType::MQ4G256,
         qt => return Err(hip_bridge::HipError::new(
             0, &format!("unsupported quant_type {qt} for {name}"),
         )),
     };
     let buf = gpu.upload_raw(data, &[data.len()])?;
-    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0 })
+    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0, awq_scale: None })
 }
 
 /// Load Gemma 4 text model weights from an HFQ file.
@@ -402,7 +404,7 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
 ///     picks those up from the same HFQ file in a separate pass.
 ///   - The `v_norm_ones_full` ones-filled scratch buffer is populated here so
 ///     the forward pass never has to manage one-time init state.
-pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
+pub fn load_weights(hfq: &mut HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
     -> HipResult<Gemma4Weights>
 {
     eprintln!("gemma4: loading embed_tokens...");
@@ -451,7 +453,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
             shape: embed_tokens.shape.clone(),
             dtype,
         };
-        WeightTensor { buf: alias_tensor, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        WeightTensor { buf: alias_tensor, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
     };
 
     eprintln!("gemma4: loading final norm...");

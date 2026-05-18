@@ -15818,6 +15818,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
+            0, // window_size: full causal (no Gemma-4 sliding window on FWHT path)
         )
     }
 
@@ -15861,6 +15862,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             None, 0, 0,
+            0, // window_size: full causal (no Gemma-4 sliding window on FWHT path)
         )
     }
 
@@ -16062,6 +16064,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
+            0, // window_size: full causal (no Gemma-4 sliding window on FWHT path)
         )
     }
 
