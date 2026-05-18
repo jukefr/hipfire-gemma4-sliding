@@ -492,21 +492,13 @@ impl Tokenizer {
     fn encode_sentencepiece(&self, text: &str) -> Vec<u32> {
         let mut tokens = Vec::new();
         // SentencePiece convention: spaces become ▁, start of text gets ▁.
-        // Single-pass build: the prior `text.replace(...)` + `format!(...)`
-        // allocated twice; iterating chars and pushing into a pre-sized
-        // String allocates once. ▁ is 3 bytes UTF-8, so the worst case
-        // (all-space input) needs `text.len() * 3 + 3` bytes; typical
-        // inputs fit in the lower-bound hint and the String grows only
-        // if needed.
         let mut sp_text = String::with_capacity(text.len() + 3);
         sp_text.push('\u{2581}');
         for ch in text.chars() {
             sp_text.push(if ch == ' ' { '\u{2581}' } else { ch });
         }
 
-        // Char-boundary byte offsets. `boundaries[i]` is the byte index of
-        // char `i`; the trailing entry is `sp_text.len()` so `boundaries[end]`
-        // is always a valid slice endpoint, including `end == n_chars`.
+        // Char-boundary byte offsets.
         let mut boundaries: Vec<usize> = Vec::with_capacity(sp_text.len() + 1);
         for (i, _) in sp_text.char_indices() {
             boundaries.push(i);
@@ -514,12 +506,26 @@ impl Tokenizer {
         boundaries.push(sp_text.len());
         let n_chars = boundaries.len() - 1;
 
+        // Longest token (in chars) in the vocabulary, cached once. Without
+        // this cap the inner loop is `(pos+1..=n_chars).rev()` — O(N) per
+        // position → O(N²) overall. On a 38 KB agent system prompt that's
+        // ~700M HashMap probes (≈70 s wallclock, 100 % CPU 0 % GPU). The
+        // longest SentencePiece token is typically ≤ 32 chars, so capping
+        // collapses encode to O(N · max_token_chars).
+        use std::sync::OnceLock;
+        static MAX_TOK_CHARS: OnceLock<usize> = OnceLock::new();
+        let max_tok_chars = *MAX_TOK_CHARS.get_or_init(|| {
+            self.vocab.iter().map(|s| s.chars().count()).max().unwrap_or(32).max(1)
+        });
+
         let mut pos = 0usize;
         while pos < n_chars {
-            // Greedy longest match from vocabulary (high-`end` first).
+            // Greedy longest match from vocabulary, bounded by the longest
+            // token length so the inner scan stays O(max_tok_chars).
             let mut best_len = 0;
             let mut best_id = 0u32;
-            for end in (pos + 1..=n_chars).rev() {
+            let scan_end = (pos + max_tok_chars).min(n_chars);
+            for end in (pos + 1..=scan_end).rev() {
                 let candidate = &sp_text[boundaries[pos]..boundaries[end]];
                 if let Some(&id) = self.token_to_id.get(candidate) {
                     best_len = end - pos;
@@ -529,8 +535,7 @@ impl Tokenizer {
             }
 
             if best_len == 0 {
-                // Single-character fallback — look up the byte slice for
-                // the one char at `pos`. Silently skips unknown chars.
+                // Single-character fallback.
                 let ch_slice = &sp_text[boundaries[pos]..boundaries[pos + 1]];
                 if let Some(&id) = self.token_to_id.get(ch_slice) {
                     tokens.push(id);

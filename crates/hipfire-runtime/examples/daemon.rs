@@ -1009,7 +1009,20 @@ fn main() {
                 // Reset conversation state without unloading the model.
                 // Under eviction, also zero the compact_offset so absolute
                 // RoPE phase restarts from zero for the fresh conversation.
+                //
+                // Gemma 4 (arch_id=7) opt-out: keep `seq_pos` and
+                // `conversation_tokens` so cross-request KV caching survives
+                // the daemon's stateless-protocol reset. State hygiene across
+                // unrelated conversations is handled by the LCP-match logic
+                // inside `generate_gemma4`. Without this, every chat
+                // completion turn re-prefills the full system prompt (4-min
+                // cold start on ~10K-token agent contexts).
                 if let Some(ref mut m) = model {
+                    if m.arch_id == 7 {
+                        let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":{},"cached":true}}"#, m.seq_pos);
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     // Multi-GPU branch: route per-LA-layer memsets through
@@ -3335,6 +3348,9 @@ fn generate_gemma4(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     let t0 = Instant::now();
+    let trace = std::env::var("HIPFIRE_GEMMA4_TRACE").ok().as_deref() == Some("1");
+    macro_rules! tlog { ($($arg:tt)*) => { if trace { eprintln!("[gemma4 {:.3}s] {}", t0.elapsed().as_secs_f64(), format!($($arg)*)); } }; }
+    tlog!("generate_gemma4 enter");
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let config = m.gemma4_config.as_ref().unwrap();
     let weights = m.gemma4_weights.as_ref().unwrap();
@@ -3412,6 +3428,8 @@ fn generate_gemma4(
                                tools, messages_history)
     };
 
+    tlog!("scaffold built, {} prompt tokens", full_prompt_tokens.len());
+
     // Align against existing cache state.
     //
     // Structured requests carry the FULL conversation each turn; do an
@@ -3474,10 +3492,19 @@ fn generate_gemma4(
     // Prefill — per-token forward into both KV caches. With cross-request
     // KV caching, prefill_len is the *new* tokens only; matched-prefix
     // tokens are already in the cache from prior requests.
+    //
+    // Emit `prefill_progress` JSON every PROGRESS_INTERVAL tokens so the CLI
+    // can convert them to keep-alive SSE chunks. Without this, omp/pi-ai's
+    // 100s first-event watchdog kills the connection during the ~3-minute
+    // cold prefill of agent-shaped 10K-token system prompts. Batched prefill
+    // (`forward_prefill_batch`) is still a stub — this keeps the wire alive
+    // until that lands.
+    const PROGRESS_INTERVAL: usize = 256;
     let kv_sliding = m.gemma4_kv_sliding.as_mut().expect("gemma4 kv_sliding");
     let kv_full = m.gemma4_kv_full.as_mut().expect("gemma4 kv_full");
     let prefill_start = Instant::now();
     let prefill_len = tokens_to_prefill.len();
+    tlog!("prefill loop start, {} new tokens", prefill_len);
     for (i, &tok) in tokens_to_prefill.iter().enumerate() {
         let pos = m.seq_pos + i;
         if let Err(e) = gemma4::forward_scratch(
@@ -3489,9 +3516,16 @@ fn generate_gemma4(
             return;
         }
         m.conversation_tokens.push(tok);
+        if (i + 1) % PROGRESS_INTERVAL == 0 && i + 1 < prefill_len {
+            let _ = writeln!(stdout,
+                r#"{{"type":"prefill_progress","id":"{}","pos":{},"total":{}}}"#,
+                id, i + 1, prefill_len);
+            let _ = stdout.flush();
+        }
     }
     m.seq_pos += prefill_len;
     let prefill_elapsed = prefill_start.elapsed().as_secs_f64();
+    tlog!("prefill done in {:.3}s ({:.1} tok/s)", prefill_elapsed, prefill_len as f64 / prefill_elapsed);
 
     // Sampler config — `Gemma4Scratch` exposes logits/sample_buf/repeat_buf.
     let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;

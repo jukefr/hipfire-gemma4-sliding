@@ -2033,6 +2033,21 @@ async function serve(port: number, host: string) {
                 let accumulated = hasTool ? "" : null;
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
+                  // Long-prefill keep-alive. Gemma 4's per-token prefill on
+                  // agent-shaped 10K+ token system prompts can take minutes;
+                  // pi-ai's first-event watchdog (100s) drops the connection
+                  // unless we emit an SSE data chunk. SSE comments (`: ...`)
+                  // don't satisfy the watchdog — only `data: { delta }` does.
+                  // Empty-content deltas are spec-legal and a no-op for the
+                  // assembled text.
+                  if (msg.type === "prefill_progress") {
+                    ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                      id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                      choices: [{ index: 0, delta: { content: "" }, finish_reason: null }]
+                    })}\n\n`));
+                    visibleChunkSent = true;
+                    continue;
+                  }
                   if (msg.type === "token") {
                     completionTokens++;
                     let text = msg.text as string;
@@ -2164,6 +2179,8 @@ async function serve(port: number, host: string) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
           else if (msg.type === "done") { promptTokens = msg.prefill_tokens ?? 0; }
           else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
+          // prefill_progress is a no-op on the non-streaming path (client is
+          // waiting for the final JSON anyway).
         }
         e.generating = false;
 
@@ -2467,6 +2484,21 @@ function loadUserAliases(): Record<string, UserAlias> {
 export function findModel(name: string): string | null {
   // Direct file path
   if (existsSync(name)) return resolve(name);
+
+  // Strip OpenAI-compatible `<provider>/<model>` prefix. OMP/agent and
+  // similar clients prefix the discovered model id with the provider name
+  // (e.g. "hipfire/gemma-4-26b-a4b-it.mq4") when calling
+  // /v1/chat/completions. We only return the bare id from /v1/models, so
+  // the provider prefix here is always a thin wrapper we can drop.
+  // Skip when the path already exists as a filesystem entry (above) or
+  // starts with "./" / "/" (real paths).
+  if (name.includes("/") && !name.startsWith("/") && !name.startsWith("./") && !name.startsWith("../")) {
+    const stripped = name.slice(name.indexOf("/") + 1);
+    if (stripped && stripped !== name) {
+      const r = findModel(stripped);
+      if (r) return r;
+    }
+  }
 
   // User aliases (from `hipfire quantize ... --register`) take precedence
   // over the built-in REGISTRY so custom tags always resolve.
