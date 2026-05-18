@@ -793,7 +793,7 @@ pub fn forward_scratch(
 ///   x = input_layernorm(x)              — RMSNorm (sandwich pre-attn)
 ///   q = q_proj(x); q = q_norm(q)        — RMSNorm over head_dim=256
 ///   k = k_proj(x); k = k_norm(k)
-///   v = v_proj(x)                        — sliding has its own v_proj
+///   v = v_proj(x); v = v_norm(v)         — no_scale RMSNorm (ones buffer)
 ///   RoPE(q, k) with rotate_half, theta=10000, full head_dim=256
 ///   write K, V to KV cache at position `pos`
 ///   attn = flash_attention(q, K, V, window_size=1024, scale=1.0 effective)
@@ -846,9 +846,16 @@ fn sliding_layer_decode(
     weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
     weight_gemv(gpu, &lw.v_proj, &scratch.tmp, &scratch.v)?;
 
-    // q_norm + k_norm across head_dim (in-place).
+    // q_norm + k_norm + no-scale v_norm across head_dim (in-place).
+    // v_norm matches HF Gemma 4 `value_states = v_norm(v_proj(x))` (no_scale=True
+    // RMSNorm — divide-only, ones buffer as weight). Same pattern as full_layer_decode.
+    // Omitting v_norm compounds attention-output bias across 48 sliding layers and
+    // produces single-token garbage end-to-end while still passing Phase 2 kernel
+    // NRMSE (which tests q_norm + k_norm but not v_norm — see d2.5-results.md).
     gpu.rmsnorm_batched(&scratch.q, &lw.q_norm, &scratch.q, n_heads, head_dim, config.norm_eps)?;
     gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
+    gpu.rmsnorm_batched(&scratch.v, &scratch.v_norm_ones_full, &scratch.v,
+        n_kv, head_dim, config.norm_eps)?;
 
     // Pre-scale Q by sqrt(head_dim) so the flash-attn kernel's internal
     // 1/sqrt(head_dim) cancels, leaving the effective Gemma 4 scale of 1.0.
