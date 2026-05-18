@@ -293,6 +293,14 @@ pub struct MoeLayerExtras {
     pub experts_down_pool: GpuTensor,
     /// Per-expert views into the pools above.
     pub experts: Vec<MoeExpertWeights>,
+    /// `[n_exp]` u64 device pointers — one per expert's gate_up weight
+    /// base. Built once at load by reading each expert's pool sub-view
+    /// pointer. The indexed MoE kernels read
+    /// `expert_ptrs[topk_indices[krank]]` to locate the active expert
+    /// weight WITHOUT a D2H sync.
+    pub experts_gate_up_ptrs: GpuTensor,
+    /// `[n_exp]` u64 device pointers for each expert's down weight base.
+    pub experts_down_ptrs: GpuTensor,
 }
 
 pub enum LayerWeights {
@@ -361,6 +369,8 @@ impl Gemma4Weights {
         // free the two pool allocations.
         let _ = gpu.free_tensor(moe.experts_gate_up_pool);
         let _ = gpu.free_tensor(moe.experts_down_pool);
+        let _ = gpu.free_tensor(moe.experts_gate_up_ptrs);
+        let _ = gpu.free_tensor(moe.experts_down_ptrs);
     }
 }
 
@@ -578,6 +588,28 @@ fn load_moe_layer_extras(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Gemma4C
         });
     }
 
+    // Build [n_exp] device tensors of u64 weight-base pointers — one for
+    // each pool. The indexed MoE kernels read these as
+    // `expert_ptrs[topk_indices[krank]]`, eliminating the per-token D2H
+    // sync of the legacy CPU per-expert loop. Pointers are stable for the
+    // model's lifetime (pool allocations don't move).
+    let gate_up_ptr_u64: Vec<u64> = experts.iter()
+        .map(|e| e.gate_up_proj.buf.buf.as_ptr() as u64)
+        .collect();
+    let down_ptr_u64: Vec<u64> = experts.iter()
+        .map(|e| e.down_proj.buf.buf.as_ptr() as u64)
+        .collect();
+    let gate_up_bytes: Vec<u8> = gate_up_ptr_u64.iter()
+        .flat_map(|p| p.to_ne_bytes())
+        .collect();
+    let down_bytes: Vec<u8> = down_ptr_u64.iter()
+        .flat_map(|p| p.to_ne_bytes())
+        .collect();
+    // Each u64 = 8 bytes = 2 f32 slots. The tensor sees [n_exp * 2]
+    // f32 entries; the kernel casts the backing buffer to u64* itself.
+    let experts_gate_up_ptrs = gpu.upload_raw(&gate_up_bytes, &[n_exp * 2])?;
+    let experts_down_ptrs = gpu.upload_raw(&down_bytes, &[n_exp * 2])?;
+
     Ok(MoeLayerExtras {
         router_proj,
         router_scale,
@@ -589,6 +621,8 @@ fn load_moe_layer_extras(hfq: &HfqFile, gpu: &mut Gpu, p: &str, config: &Gemma4C
         experts_gate_up_pool: gate_up_pool,
         experts_down_pool: down_pool,
         experts,
+        experts_gate_up_ptrs,
+        experts_down_ptrs,
     })
 }
 
@@ -834,6 +868,17 @@ pub struct Gemma4Scratch {
     pub moe_expert_gate_up: GpuTensor, // [2 * moe_intermediate_size]
     pub moe_expert_hidden: GpuTensor,  // [moe_intermediate_size] — gelu(gate) * up
     pub moe_expert_out: GpuTensor,     // [dim] — single expert's down_proj output
+
+    // ── Indexed MoE batched scratch (k_top=8 hardcoded by kernel). ──────
+    // These back the device-side fused path that replaces the 8-iteration
+    // per-expert CPU loop. Only allocated when the MoE branch is enabled.
+    /// `[dim]` — moe_pre2 after one FWHT pass (MQ4 gate_up expects pre-rotated x).
+    pub moe_pre2_rot: GpuTensor,
+    /// `[k_top × 2 × mi]` — fused gate+up output, one row per top-K rank.
+    pub moe_expert_gate_batch: GpuTensor, // [k_top × mi]
+    pub moe_expert_up_batch:   GpuTensor, // [k_top × mi]
+    /// `[k_top × mi]` — gelu_tanh(gate)*up batched over k_top experts.
+    pub moe_expert_hidden_batch: GpuTensor,
 }
 
 impl Gemma4Scratch {
@@ -914,6 +959,12 @@ impl Gemma4Scratch {
         let moe_expert_hidden = gpu.zeros(&[mi], DType::F32)?;
         let moe_expert_out = gpu.zeros(&[dim], DType::F32)?;
 
+        // Indexed-MoE scratch (k_top fixed at 8 by the kernel).
+        let moe_pre2_rot = gpu.zeros(&[dim], DType::F32)?;
+        let moe_expert_gate_batch = gpu.zeros(&[k_top * mi], DType::F32)?;
+        let moe_expert_up_batch   = gpu.zeros(&[k_top * mi], DType::F32)?;
+        let moe_expert_hidden_batch = gpu.zeros(&[k_top * mi], DType::F32)?;
+
         Ok(Gemma4Scratch {
             x, residual, tmp, pos_buf,
             q, k, v, attn_out,
@@ -925,6 +976,9 @@ impl Gemma4Scratch {
             moe_cur_mlp, moe_pre2, moe_router_in, moe_router_logits,
             moe_topk_indices, moe_topk_weights, moe_cur_moe,
             moe_expert_gate_up, moe_expert_hidden, moe_expert_out,
+            moe_pre2_rot,
+            moe_expert_gate_batch, moe_expert_up_batch,
+            moe_expert_hidden_batch,
         })
     }
 
@@ -963,6 +1017,10 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.moe_expert_gate_up);
         let _ = gpu.free_tensor(self.moe_expert_hidden);
         let _ = gpu.free_tensor(self.moe_expert_out);
+        let _ = gpu.free_tensor(self.moe_pre2_rot);
+        let _ = gpu.free_tensor(self.moe_expert_gate_batch);
+        let _ = gpu.free_tensor(self.moe_expert_up_batch);
+        let _ = gpu.free_tensor(self.moe_expert_hidden_batch);
     }
 }
 
@@ -1041,44 +1099,115 @@ fn apply_moe_branch(
         true,
     )?;
 
-    // 6) D2H topk indices + weights so the CPU loop can index into
-    //    `moe.experts[e]`. The fused indexed-GEMV path (not ported here)
-    //    keeps these on device and dispatches a single batched GEMV;
-    //    legacy path needs CPU access for the per-expert weight lookup.
-    let idx_bytes = gpu.download_f32(&scratch.moe_topk_indices)?;
-    let topk_indices: Vec<usize> = unsafe {
-        std::slice::from_raw_parts(idx_bytes.as_ptr() as *const i32, k_top)
-    }.iter().map(|&i| i as usize).collect();
-    let topk_weights = gpu.download_f32(&scratch.moe_topk_weights)?;
-    for &e in topk_indices.iter().take(k_top) {
-        if e >= n_exp {
-            return Err(hip_bridge::HipError::new(
-                0, &format!("MoE topk index {e} out of range (n_exp={n_exp})"),
-            ));
-        }
+    // 6) Dispatch top-K experts. Two paths:
+    //
+    //   (a) Indexed (fast) path: gate_up is MQ4G256/MG4G256 and down is
+    //       Q8_0. Two kernel launches replace the 8-iteration CPU loop +
+    //       2 D2H syncs/layer (=60 syncs/token on 30-layer Gemma 4 26B).
+    //       Whole MoE branch becomes hipGraph-capturable.
+    //
+    //   (b) Legacy path: any other quant mix. CPU per-expert loop with
+    //       the 2 D2H downloads per layer.
+    //
+    // 26B-A4B-it (Gemma 4): gate_up=MQ4G256 (dim=2816 / 256-aligned),
+    // down=Q8_0 (mi=704 not 256-aligned → quantizer falls back to Q8_0).
+    // Hits the fast path. Other Gemma 4 variants might land in legacy.
+    let first = &moe.experts[0];
+    let gate_ok = first.gate_up_proj.gpu_dtype == rdna_compute::DType::MQ4G256;
+    let down_q8  = first.down_proj.gpu_dtype == rdna_compute::DType::Q8_0;
+    let down_hfq4g128 = first.down_proj.gpu_dtype == rdna_compute::DType::HFQ4G128;
+    let fast = gate_ok && (down_q8 || down_hfq4g128);
+    {
+        use std::sync::OnceLock;
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        LOGGED.get_or_init(|| {
+            eprintln!("[gemma4 MoE] dispatch path: {} (gate_up={:?} down={:?})",
+                if fast { "indexed-fast" } else { "legacy-cpu-loop" },
+                first.gate_up_proj.gpu_dtype, first.down_proj.gpu_dtype);
+        });
     }
 
-    // 7) Zero accumulator
-    gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
+    if fast {
+        // Pre-rotate moe_pre2 once via FWHT (MQ4 GEMV expects rotated x).
+        gpu.rotate_x_mq(&scratch.moe_pre2, &scratch.moe_pre2_rot, dim)?;
 
-    // 8) Per-expert serialized loop. 8 iterations × 5 launches each.
-    for ki in 0..k_top {
-        let e = topk_indices[ki];
-        let weight = topk_weights[ki] * moe.per_expert_scale_host[e];
-        let expert = &moe.experts[e];
+        // Indexed gate_up: 8 fused GEMVs reading expert IDs from device.
+        //   y_gate: [k_top × mi], y_up: [k_top × mi]
+        gpu.gemv_mq4g256_moe_gate_up_k8_indexed(
+            &moe.experts_gate_up_ptrs,
+            &scratch.moe_topk_indices,
+            &scratch.moe_pre2_rot,
+            &scratch.moe_expert_gate_batch,
+            &scratch.moe_expert_up_batch,
+            2 * mi, dim,
+        )?;
 
-        // gate_up[2*mi] = expert.gate_up_proj @ pre2
-        weight_gemv(gpu, &expert.gate_up_proj, &scratch.moe_pre2, &scratch.moe_expert_gate_up)?;
-        // Split: rows [0, mi) = gate; rows [mi, 2*mi) = up.
-        let gate = scratch.moe_expert_gate_up.sub_offset(0, mi);
-        let up   = scratch.moe_expert_gate_up.sub_offset(mi, mi);
-        // hidden = gelu_tanh(gate) * up
-        gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
-        gpu.mul_f32(&scratch.moe_expert_hidden, &up, &scratch.moe_expert_hidden)?;
-        // expert_out[dim] = expert.down_proj @ hidden
-        weight_gemv(gpu, &expert.down_proj, &scratch.moe_expert_hidden, &scratch.moe_expert_out)?;
-        // cur_moe += weight * expert_out
-        gpu.scaled_add_inplace_cpu_scalar_f32(&scratch.moe_cur_moe, &scratch.moe_expert_out, weight)?;
+        // Batched gelu_tanh + mul over [k_top × mi].
+        gpu.gelu_tanh_f32(&scratch.moe_expert_gate_batch,
+            &scratch.moe_expert_hidden_batch, k_top * mi)?;
+        gpu.mul_f32(&scratch.moe_expert_hidden_batch,
+            &scratch.moe_expert_up_batch,
+            &scratch.moe_expert_hidden_batch)?;
+
+        // Zero accumulator (memset is sync but tiny — 11 KB for dim=2816).
+        gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
+
+        // Indexed down + scaled residual: 8 fused GEMVs, atomicAdd into
+        // moe_cur_moe with scale = topk_weights[krank] *
+        // per_expert_scale[topk_indices[krank]] (all on device). Quant
+        // variant picked by the down weight format. Gemma 4 26B-A4B-it's
+        // down has K=mi=704 → HFQ4G128. Future Gemma 4 sizes with
+        // K%32==0 only could land on Q8_0 instead.
+        if down_q8 {
+            gpu.gemv_q8_0_moe_down_residual_scaled_k8_indexed(
+                &moe.experts_down_ptrs,
+                &scratch.moe_topk_indices,
+                &scratch.moe_topk_weights,
+                &moe.per_expert_scale,
+                &scratch.moe_expert_hidden_batch,
+                &scratch.moe_cur_moe,
+                dim, mi,
+            )?;
+        } else {
+            // down_hfq4g128 path.
+            gpu.gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(
+                &moe.experts_down_ptrs,
+                &scratch.moe_topk_indices,
+                &scratch.moe_topk_weights,
+                &moe.per_expert_scale,
+                &scratch.moe_expert_hidden_batch,
+                &scratch.moe_cur_moe,
+                dim, mi,
+            )?;
+        }
+    } else {
+        // ── Legacy CPU per-expert path (quant mix doesn't match the
+        //    fast kernels). 60 D2H syncs/token, no graph capture. ──
+        let idx_bytes = gpu.download_f32(&scratch.moe_topk_indices)?;
+        let topk_indices: Vec<usize> = unsafe {
+            std::slice::from_raw_parts(idx_bytes.as_ptr() as *const i32, k_top)
+        }.iter().map(|&i| i as usize).collect();
+        let topk_weights = gpu.download_f32(&scratch.moe_topk_weights)?;
+        for &e in topk_indices.iter().take(k_top) {
+            if e >= n_exp {
+                return Err(hip_bridge::HipError::new(
+                    0, &format!("MoE topk index {e} out of range (n_exp={n_exp})"),
+                ));
+            }
+        }
+        gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
+        for ki in 0..k_top {
+            let e = topk_indices[ki];
+            let weight = topk_weights[ki] * moe.per_expert_scale_host[e];
+            let expert = &moe.experts[e];
+            weight_gemv(gpu, &expert.gate_up_proj, &scratch.moe_pre2, &scratch.moe_expert_gate_up)?;
+            let gate = scratch.moe_expert_gate_up.sub_offset(0, mi);
+            let up   = scratch.moe_expert_gate_up.sub_offset(mi, mi);
+            gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
+            gpu.mul_f32(&scratch.moe_expert_hidden, &up, &scratch.moe_expert_hidden)?;
+            weight_gemv(gpu, &expert.down_proj, &scratch.moe_expert_hidden, &scratch.moe_expert_out)?;
+            gpu.scaled_add_inplace_cpu_scalar_f32(&scratch.moe_cur_moe, &scratch.moe_expert_out, weight)?;
+        }
     }
 
     // 9) cur_moe = post_feedforward_layernorm_2(cur_moe) — in-place

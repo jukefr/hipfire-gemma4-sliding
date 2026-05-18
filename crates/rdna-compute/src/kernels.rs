@@ -460,6 +460,23 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_wave64.hip");
 
+/// Gemma 4 MoE down_proj Q8_0 variant of the indexed MoE down GEMV. Same
+/// device-side dispatch pattern (expert_ptrs, topk_indices, topk_weights,
+/// per_expert_scale all on device → hipGraph-capture-safe), but reads
+/// Q8_0 row layout (blocks_per_row = K/32, 34 B per block = 2 B f16
+/// scale + 32 int8 quants) instead of HFQ4G256's 136 B groups. Used by
+/// `apply_moe_branch` on arch_id=7 where mi=704 isn't 256-aligned so the
+/// quantizer fallback chain lands the down weights on Q8_0.
+pub const GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip");
+
+/// HFQ4G128 variant. Used by Gemma 4 26B-A4B-it where down_proj has
+/// K=704 (= moe_intermediate_size, not 256-aligned) and lands on the
+/// quantizer's HFQ4G128 fallback. Same device-side dispatch pattern as
+/// the Q8_0 / HFQ4G256 indexed variants.
+pub const GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_moe_down_residual_scaled_k8_indexed.hip");
+
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
 /// layer; one workgroup per token. Enables batched MoE prefill.

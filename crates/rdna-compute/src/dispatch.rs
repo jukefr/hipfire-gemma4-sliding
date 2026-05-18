@@ -9148,6 +9148,141 @@ impl Gpu {
         result
     }
 
+    /// Gemma 4 MoE down_proj Q8_0 variant of the indexed MoE down GEMV.
+    /// Wraps the same expert_ptrs / topk_indices / topk_weights /
+    /// per_expert_scale device-side dispatch pattern, but reads Q8_0 row
+    /// layout (blocks_per_row = K/32, 34 B per block). The legacy CPU
+    /// per-expert loop downloads top-K twice per layer (60 D2H syncs per
+    /// token across 30 MoE layers); this kernel keeps everything on device
+    /// and replays cleanly under hipGraph capture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_moe_down_residual_scaled_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
+            kernels::GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC,
+            "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
+        )?;
+        let pp   = expert_ptrs.buf.as_ptr();
+        let ip   = topk_indices.buf.as_ptr();
+        let wp   = topk_weights.buf.as_ptr();
+        let pesp = per_expert_scale.buf.as_ptr();
+        let hbp  = hidden_batch.buf.as_ptr();
+        let xrp  = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp   as *const _ as *mut c_void,
+            &ip   as *const _ as *mut c_void,
+            &wp   as *const _ as *mut c_void,
+            &pesp as *const _ as *mut c_void,
+            &hbp  as *const _ as *mut c_void,
+            &xrp  as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let func_name = "gemv_q8_0_moe_down_residual_scaled_k8_indexed";
+        let result = self.launch_maybe_blob(
+            func_name,
+            [m as u32, 8, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(wp);
+                b.push_ptr(pesp); b.push_ptr(hbp); b.push_ptr(xrp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        result
+    }
+
+    /// HFQ4G128 variant of the indexed MoE down GEMV. Used by Gemma 4
+    /// 26B-A4B-it where down_proj K=704 lands on the HFQ4G128 fallback
+    /// (not 256-aligned). Same dispatch pattern as the Q8_0 helper above;
+    /// the only difference is the kernel reads HFQ4G128's 72 B groups
+    /// (ceil(K/128) of them per row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed",
+            kernels::GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC,
+            "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed",
+        )?;
+        let pp   = expert_ptrs.buf.as_ptr();
+        let ip   = topk_indices.buf.as_ptr();
+        let wp   = topk_weights.buf.as_ptr();
+        let pesp = per_expert_scale.buf.as_ptr();
+        let hbp  = hidden_batch.buf.as_ptr();
+        let xrp  = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp   as *const _ as *mut c_void,
+            &ip   as *const _ as *mut c_void,
+            &wp   as *const _ as *mut c_void,
+            &pesp as *const _ as *mut c_void,
+            &hbp  as *const _ as *mut c_void,
+            &xrp  as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let func_name = "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed";
+        self.launch_maybe_blob(
+            func_name,
+            [m as u32, 8, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(wp);
+                b.push_ptr(pesp); b.push_ptr(hbp); b.push_ptr(xrp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// Gemma 4 MoE gate_up MQ4G256/MG4G256 indexed dispatch. The MQ4 GEMV
+    /// inner loop is byte-identical to HFQ4G256's (same 136 B groups);
+    /// the only difference is the caller pre-rotates x via FWHT once
+    /// before launch. So we reuse `gemv_hfq4g256_moe_gate_up_k8_indexed`
+    /// — the caller is responsible for passing `x_rot` (post-FWHT input).
+    /// Signature is identical to the HFQ4G256 indexed helper for
+    /// drop-in substitution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq4g256_moe_gate_up_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up:   &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        // Reuse the HFQ4G256 indexed kernel — same memory layout, same
+        // inner loop. Caller already did the FWHT pre-rotation.
+        self.gemv_hfq4g256_moe_gate_up_k8_indexed(
+            expert_ptrs, topk_indices, x_rot, y_gate, y_up, m, k,
+        )
+    }
+
     /// N-batched MoE softmax + top-K + renorm. Grid = (N, 1, 1); one
     /// workgroup per token. `logits` is [N × n_exp], `topk_idx` is
     /// [N × K_TOP] i32, `topk_w` is [N × K_TOP] f32.
