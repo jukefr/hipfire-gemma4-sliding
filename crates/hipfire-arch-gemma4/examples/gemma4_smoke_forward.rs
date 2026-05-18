@@ -71,8 +71,12 @@ fn main() {
     } else {
         kv_seq
     };
-    // Full KV is forced to FP32 because the quantized flash kernels truncate head_dim>256.
-    eprintln!("KV cache: sliding={kv_mode} @ {sliding_kv_seq} (window={}) / full=fp32 @ {kv_seq}",
+    // Full KV defaults to asym3 (hd=512 supported by full_layer_decode). FP32
+    // costs 5.4 GB at 128k vs asym3's ~970 MB — required to fit on 17 GB VRAM.
+    // Override with HIPFIRE_SMOKE_FULL_KV=fp32 for debugging.
+    let full_kv_mode = std::env::var("HIPFIRE_SMOKE_FULL_KV").unwrap_or_else(|_| "asym3".to_string());
+    eprintln!(
+        "KV cache: sliding={kv_mode} @ {sliding_kv_seq} (window={}) / full={full_kv_mode} @ {kv_seq}",
         config.sliding_window);
 
     let mut kv_sliding = match kv_mode.as_str() {
@@ -81,7 +85,10 @@ fn main() {
         "q8"    => KvCache::new_gpu_q8(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_kv_seq),
         _       => KvCache::new_gpu_asym3(&mut gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim, sliding_kv_seq),
     }.expect("kv sliding alloc");
-    let mut kv_full = KvCache::new_gpu(&mut gpu, n_full, config.full_n_kv_heads, config.full_head_dim, kv_seq)
+    let mut kv_full = match full_kv_mode.as_str() {
+        "fp32"  => KvCache::new_gpu(&mut gpu, n_full, config.full_n_kv_heads, config.full_head_dim, kv_seq),
+        _       => KvCache::new_gpu_asym3(&mut gpu, n_full, config.full_n_kv_heads, config.full_head_dim, kv_seq),
+    }
         .expect("kv full alloc");
 
     let scratch = Gemma4Scratch::new(&mut gpu, &config, 64).expect("scratch alloc");
