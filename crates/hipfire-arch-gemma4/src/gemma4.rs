@@ -1123,6 +1123,15 @@ pub fn forward_scratch(
         EmbeddingFormat::F32     => gpu.embedding_lookup(&weights.embed_tokens, &scratch.x, token, dim)?,
         _ => return Err(hip_bridge::HipError::new(0, "unsupported Gemma 4 embed format")),
     }
+    if std::env::var("HIPFIRE_DUMP_PER_LAYER").ok().as_deref() == Some("1") && pos == 0 {
+        let v = gpu.download_f32(&scratch.x)?;
+        let n = v.len();
+        let rms = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64).sqrt();
+        let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("[layer-trace] {:<28}  n={n:>5}  rms={rms:>10.6}  min={mn:>+9.6}  max={mx:>+9.6}  first8={:?}",
+            "embed RAW (pre-scale)", &v[..8]);
+    }
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
 
     // Diagnostic: per-layer scratch.x magnitude trace. HIPFIRE_DUMP_PER_LAYER=1
@@ -1389,13 +1398,34 @@ fn sliding_layer_decode(
 
     // Pre-FFN norm.
     gpu.rmsnorm_f32(&scratch.x, &lw.pre_feedforward_layernorm, &scratch.tmp, config.norm_eps)?;
+    stat(gpu, &scratch.tmp, "L0/tmp post-pre-ffn-norm")?;
 
     // SwiGLU(gelu_pytorch_tanh): gate_proj, up_proj, gelu_tanh(gate) * up → down_proj.
     weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
     weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
+    stat_n(gpu, &scratch.gate_ffn, "L0/gate post-gate_proj", config.hidden_dim)?;
+    stat_n(gpu, &scratch.up_ffn, "L0/up post-up_proj", config.hidden_dim)?;
     gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, config.hidden_dim)?;
+    stat_n(gpu, &scratch.ffn_hidden, "L0/gelu(gate)", config.hidden_dim)?;
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
+    stat_n(gpu, &scratch.ffn_hidden, "L0/gelu(gate)*up", config.hidden_dim)?;
+    if dump_layer0 {
+        let v = gpu.download_f32(&scratch.ffn_hidden)?;
+        let live: &[f32] = &v[..config.hidden_dim];
+        let bytes = unsafe { std::slice::from_raw_parts(live.as_ptr() as *const u8, live.len() * 4) };
+        std::fs::write("/tmp/hipfire_ffn_hidden.bin", bytes).ok();
+    }
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
+    stat(gpu, &scratch.ffn_out, "L0/ffn_out post-down")?;
+    if dump_layer0 {
+        let v = gpu.download_f32(&scratch.ffn_out)?;
+        let first8: Vec<f32> = v[..8].to_vec();
+        eprintln!("[L0] L0/ffn_out first 8: {:?}", first8);
+        // Dump to file for cross-comparison with REF.
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        std::fs::write("/tmp/hipfire_ffn_out.bin", bytes).ok();
+        eprintln!("[L0] L0/ffn_out: wrote /tmp/hipfire_ffn_out.bin ({} floats)", v.len());
+    }
 
     // Sandwich post-FFN norm. On MoE layers (26B-A4B) this is folded into
     // apply_moe_branch (which adds the parallel MoE branch + sandwich norms

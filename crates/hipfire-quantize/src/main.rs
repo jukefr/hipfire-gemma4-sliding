@@ -3741,6 +3741,13 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
+            // MoE expert down_proj at K=704 (Gemma 4 26B-A4B
+            // moe_intermediate_size) is NOT 128-aligned either. HFQ4G128
+            // is still safe — the kernel was patched to handle K not
+            // divisible by 128 via per-element bounds check on the partial
+            // last group (kernels/src/gemv_hfq4g128.hip). The quantizer
+            // already pads partial groups with min_val so storage is
+            // always `ceil(K/128) * 72` bytes per row.
             let mut new_tensors: Vec<HfqTensor> = (0..n_experts).into_par_iter().map(|x| {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
@@ -3758,7 +3765,26 @@ fn main() {
                     let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32)
                 } else {
-                    let q = quantize_hfq4g128(&f32_slice);
+                    // Same per-row caveat as the dense down_proj path: for
+                    // K not divisible by 128 (Gemma 4 26B-A4B MoE
+                    // moe_intermediate=704), quantize per-row so blocks
+                    // don't cross row boundaries.
+                    let k_dim_local = inner_shape_clone[1] as usize;
+                    let m_dim_local = inner_shape_clone[0] as usize;
+                    let q = if k_dim_local % 128 != 0 {
+                        let row_blocks = (k_dim_local + 127) / 128;
+                        let row_bytes = row_blocks * 72;
+                        let mut out = vec![0u8; m_dim_local * row_bytes];
+                        for r in 0..m_dim_local {
+                            let row = &f32_slice[r * k_dim_local..(r + 1) * k_dim_local];
+                            let q_row = quantize_hfq4g128(row);
+                            out[r * row_bytes..r * row_bytes + q_row.len()]
+                                .copy_from_slice(&q_row);
+                        }
+                        out
+                    } else {
+                        quantize_hfq4g128(&f32_slice)
+                    };
                     (q, QuantType::HFQ4G128, 128u32)
                 };
                 HfqTensor {
@@ -3986,15 +4012,40 @@ fn main() {
                     let q = quantize_mg4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MG4G256, 256u32, "MG4G256")
                 } else {
-                    // Fallback to MQ4 (true min..max) on non-256-aligned tails.
-                    // Acceptable because (a) percentile-clip needs 256 samples
-                    // for stable P02/P98, and (b) non-aligned dims are rare on
-                    // Gemma 4 (head_dim=256/512, hidden=5376, intermediate=21504
-                    // are all 256-aligned).
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256(non-256-aligned MG4 fallback)")
+                    // Fallback to HFQ4G128 for non-256-aligned K. MQ4G256 is
+                    // off the table here (its `rotate_x_mq` does integer-
+                    // divide group counting and silently drops the partial
+                    // trailing group on Gemma 4 26B-A4B intermediate=2112).
+                    // HFQ4G128's kernel was patched to handle K not divisible
+                    // by 128 via per-element bounds check on the partial
+                    // last group.
+                    //
+                    // For 2D weights with K NOT divisible by 128 we MUST
+                    // quantize per-row — calling `quantize_hfq4g128` on
+                    // the flat tensor lays out blocks that cross row
+                    // boundaries (e.g. block 16 of row 0 contains row 0's
+                    // tail + row 1's head, which is then mis-interpreted
+                    // at decode time). Tracked via cosine_sim≈0 on layer-0
+                    // ffn_out vs PyTorch reference 2026-05-18.
+                    let k_dim_local = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                    let m_dim_local = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
+                    let q = if k_dim_local % 128 != 0 && meta.shape.len() == 2 {
+                        // Per-row pass: each row gets ceil(K/128) blocks
+                        // independently — no block crosses row boundaries.
+                        use rayon::prelude::*;
+                        let row_blocks = (k_dim_local + 127) / 128;
+                        let row_bytes = row_blocks * 72;
+                        let mut out = vec![0u8; m_dim_local * row_bytes];
+                        out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(r, dst)| {
+                            let row = &f32_data[r * k_dim_local..(r + 1) * k_dim_local];
+                            let q_row = quantize_hfq4g128(row);
+                            dst[..q_row.len()].copy_from_slice(&q_row);
+                        });
+                        out
+                    } else {
+                        quantize_hfq4g128(&f32_data)
+                    };
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128(non-256-aligned MG4 fallback)")
                 }
             } else if (use_mq4g256 || use_mq4_mq6exp) && is_embed {
                 let q = quantize_q8f16(&f32_data);
