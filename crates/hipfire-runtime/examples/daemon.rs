@@ -1700,13 +1700,18 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
 
         // KV caches. asym3 default — sliding ring-buffers at sliding_window
         // (constant 76 MB on 26B), full at max_seq (e.g. 970 MB at 128k).
-        let kv_mode_eff = if kv_mode.is_empty() { "asym3".to_string() } else { kv_mode.clone() };
-        if kv_mode_eff != "asym3" {
-            return Err(format!(
-                "Gemma 4 currently supports kv_mode=asym3 only (got {kv_mode_eff}). \
-                 The sliding ring-buffer + hd=512 full-attention kernels are wired \
-                 for asym3 only."));
-        }
+        // Accept the same aliases the qwen35 path does so the CLI's default
+        // kv_mode="auto" works without a special case.
+        let kv_mode_eff = match kv_mode.as_str() {
+            "" | "auto" | "asym3" | "turbo3" | "turbo" => "asym3",
+            other => {
+                return Err(format!(
+                    "Gemma 4 currently supports kv_mode=asym3 only (got {other}). \
+                     The sliding ring-buffer + hd=512 full-attention kernels are \
+                     wired for asym3 only."));
+            }
+        };
+        let _ = kv_mode_eff;
         let kv_sliding = llama::KvCache::new_gpu_asym3(
             gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim,
             config.sliding_window,
