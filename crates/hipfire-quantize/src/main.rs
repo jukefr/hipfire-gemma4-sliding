@@ -4318,16 +4318,22 @@ fn main() {
         //     shape: [num_experts, 2 * moe_intermediate, hidden_size]
         //   model.language_model.layers.{N}.mlp.experts.down_proj
         //     shape: [num_experts, hidden_size, moe_intermediate]
+        // Gemma 4 26B-A4B uses the SAME layout but at a different prefix
+        // (no `mlp.` — tensors live directly under `.experts.`):
+        //   model.language_model.layers.{N}.experts.gate_up_proj
+        //   model.language_model.layers.{N}.experts.down_proj
         // Note: no `.weight` suffix on these, so should_quantize() returns false
         // and the standard path would store them as F16 — defeating the purpose.
         // We split into per-expert 2D MQ4G256 quantized tensors named
-        //   model.language_model.layers.{N}.mlp.experts.{X}.{base}.weight
-        // so the engine loader can fish them out by expert index.
-        if is_moe
-            && name.contains("mlp.experts.")
-            && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
-            && meta.shape.len() == 3
-        {
+        //   <parent>.experts.{X}.{base}.weight
+        // so the engine loader can fish them out by expert index. The parent
+        // path is extracted from the source name verbatim, so qwen3.5 stays
+        // `mlp.experts.{X}.{base}.weight` while gemma4 becomes
+        // `experts.{X}.{base}.weight` — both match their respective loaders.
+        let is_moe_expert_3d = (is_moe || is_gemma4)
+            && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+            && meta.shape.len() == 3;
+        if is_moe_expert_3d {
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
