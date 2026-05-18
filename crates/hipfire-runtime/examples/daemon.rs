@@ -27,6 +27,7 @@ use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_arch_gemma4::gemma4;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_arch_qwen35::speculative::{
     self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
@@ -324,6 +325,13 @@ struct LoadedModel {
     llama_weights: Option<llama::LlamaWeights>,
     llama_scratch: Option<llama::ForwardScratch>,
     llama_kv: Option<llama::KvCache>,
+    // Gemma 4 state (arch_id=7). Sliding + full attention with two separate KV
+    // caches (sliding sized at sliding_window for ring buffer, full at max_seq).
+    gemma4_config: Option<gemma4::Gemma4Config>,
+    gemma4_weights: Option<gemma4::Gemma4Weights>,
+    gemma4_scratch: Option<gemma4::Gemma4Scratch>,
+    gemma4_kv_sliding: Option<llama::KvCache>,
+    gemma4_kv_full: Option<llama::KvCache>,
     // Vision state (VL models only)
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
@@ -672,12 +680,15 @@ fn main() {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
+                            7 => "gemma4",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some();
                         let (dim, layers, vocab) = if let Some(ref c) = m.q35_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.llama_config {
+                            (c.dim, c.n_layers, c.vocab_size)
+                        } else if let Some(ref c) = m.gemma4_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else { (0, 0, 0) };
                         // ── Optional DPM stabilization (perf instrumentation) ──
@@ -1653,12 +1664,82 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             q35_config: Some(config), q35_weights: Some(weights), q35_scratch: Some(scratch),
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            gemma4_config: None, gemma4_weights: None, gemma4_scratch: None,
+            gemma4_kv_sliding: None, gemma4_kv_full: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
+            chat_template,
+        })
+    } else if hfq.arch_id == 7 {
+        // Gemma 4 (26B-A4B-it MoE + smaller dense variants). Sliding + full
+        // attention with two separate KV caches. Sliding cache uses ring-buffer
+        // (asym3) sized at sliding_window; full cache at max_seq. Eviction /
+        // DFlash / PFlash / multi-GPU not supported on this path.
+        if cask.sidecar.is_some() {
+            return Err("CASK / TriAttention eviction is not yet supported for Gemma 4 (arch_id=7)".to_string());
+        }
+        if draft_path.is_some() {
+            return Err("DFlash draft speculative decode is not yet supported for Gemma 4 (arch_id=7)".to_string());
+        }
+        let config = gemma4::config_from_hfq(&hfq).ok_or("parse Gemma4Config")?;
+        let weights = gemma4::load_weights(&mut hfq, &config, gpu).map_err(|e| format!("{e}"))?;
+
+        let n_sliding = config.layer_types.iter()
+            .filter(|&&t| t == gemma4::LayerType::Sliding).count();
+        let n_full = config.layer_types.iter()
+            .filter(|&&t| t == gemma4::LayerType::Full).count();
+        eprintln!(
+            "  Gemma 4: dim={}, layers={} ({} sliding + {} full), vocab={}, sliding_window={}",
+            config.dim, config.n_layers, n_sliding, n_full, config.vocab_size,
+            config.sliding_window,
+        );
+
+        // KV caches. asym3 default — sliding ring-buffers at sliding_window
+        // (constant 76 MB on 26B), full at max_seq (e.g. 970 MB at 128k).
+        let kv_mode_eff = if kv_mode.is_empty() { "asym3".to_string() } else { kv_mode.clone() };
+        if kv_mode_eff != "asym3" {
+            return Err(format!(
+                "Gemma 4 currently supports kv_mode=asym3 only (got {kv_mode_eff}). \
+                 The sliding ring-buffer + hd=512 full-attention kernels are wired \
+                 for asym3 only."));
+        }
+        let kv_sliding = llama::KvCache::new_gpu_asym3(
+            gpu, n_sliding, config.sliding_n_kv_heads, config.sliding_head_dim,
+            config.sliding_window,
+        ).map_err(|e| format!("kv_sliding alloc: {e}"))?;
+        let kv_full = llama::KvCache::new_gpu_asym3(
+            gpu, n_full, config.full_n_kv_heads, config.full_head_dim, max_seq,
+        ).map_err(|e| format!("kv_full alloc: {e}"))?;
+        eprintln!(
+            "  KV cache: sliding=asym3@{} (ring) / full=asym3@{}",
+            config.sliding_window, max_seq,
+        );
+
+        let scratch = gemma4::Gemma4Scratch::new(gpu, &config, 64)
+            .map_err(|e| format!("scratch: {e}"))?;
+        gemma4::init_scratch_constants(gpu, &scratch, config.full_head_dim)
+            .map_err(|e| format!("scratch constants: {e}"))?;
+
+        let chat_template = resolve_chat_template(&hfq, path);
+        Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            gemma4_config: Some(config), gemma4_weights: Some(weights),
+            gemma4_scratch: Some(scratch),
+            gemma4_kv_sliding: Some(kv_sliding), gemma4_kv_full: Some(kv_full),
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
+            model_path: path.to_string(),
+            dflash: None,
             chat_template,
         })
     } else {
@@ -1682,6 +1763,8 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             q35_config: None, q35_weights: None, q35_scratch: None,
             kv_cache: None, dn_state: None,
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
+            gemma4_config: None, gemma4_weights: None, gemma4_scratch: None,
+            gemma4_kv_sliding: None, gemma4_kv_full: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -1811,6 +1894,8 @@ fn load_model_pp(
         kv_cache: Some(kv),
         dn_state: Some(dn),
         llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+        gemma4_config: None, gemma4_weights: None, gemma4_scratch: None,
+        gemma4_kv_sliding: None, gemma4_kv_full: None,
         vision_config: None, vision_weights: None,
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -1912,10 +1997,15 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(s) = m.q35_scratch { s.free_gpu(gpu); }
     if let Some(kv) = m.llama_kv { kv.free_gpu(gpu); }
     if let Some(s) = m.llama_scratch { s.free_gpu(gpu); }
+    // Gemma 4 path: free both KV caches + scratch before weights.
+    if let Some(kv) = m.gemma4_kv_sliding { kv.free_gpu(gpu); }
+    if let Some(kv) = m.gemma4_kv_full { kv.free_gpu(gpu); }
+    if let Some(s) = m.gemma4_scratch { s.free_gpu(gpu); }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
     if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.gemma4_weights { w.free_gpu(gpu); }
     if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
     // about to be returned to the pool. Without this, the next model loaded
@@ -3129,8 +3219,187 @@ fn generate_multi(
     let _ = stdout.flush();
 }
 
+/// Minimal AR generate path for Gemma 4 (arch_id=7).
+///
+/// Mirrors `gemma4_smoke_forward`'s per-token loop but emits JSON `token` /
+/// `done` events on stdout instead of debug prints. No DFlash, no eviction,
+/// no multi-GPU, no PFlash. Uses Gemma's ChatML scaffold
+/// (`<start_of_turn>user / model<end_of_turn>`) and stops on `<end_of_turn>`
+/// or `config.eos_token`.
+#[allow(clippy::too_many_arguments)]
+fn generate_gemma4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+) {
+    let t0 = Instant::now();
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let config = m.gemma4_config.as_ref().unwrap();
+    let weights = m.gemma4_weights.as_ref().unwrap();
+    let scratch = m.gemma4_scratch.as_ref().unwrap();
+
+    // Build the ChatML-wrapped prompt. Gemma 4 doesn't have a system role —
+    // splice the system text into the user turn if provided.
+    let user_text = match system_prompt {
+        Some(sp) if !sp.is_empty() => format!("{sp}\n\n{prompt}"),
+        _ => prompt.to_string(),
+    };
+    let scaffolded = format!(
+        "<start_of_turn>user\n{user_text}<end_of_turn>\n<start_of_turn>model\n"
+    );
+
+    // BOS + scaffold tokens. HF's Gemma 4 tokenizer always prepends `<bos>`.
+    let mut prompt_tokens: Vec<u32> = vec![config.bos_token];
+    prompt_tokens.extend(tokenizer.encode(&scaffolded));
+
+    // Reset on overflow. Full-context KV is at max_seq slots; sliding ring-
+    // buffers don't need this guard.
+    let est_total = m.seq_pos + prompt_tokens.len() + max_tokens;
+    if est_total > m.max_seq {
+        eprintln!("[daemon] gemma4 context full ({}+{}+{}>{}) — resetting conversation",
+            m.seq_pos, prompt_tokens.len(), max_tokens, m.max_seq);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        if let Some(kv) = m.gemma4_kv_sliding.as_mut() { kv.compact_offset = 0; }
+        if let Some(kv) = m.gemma4_kv_full.as_mut() { kv.compact_offset = 0; }
+    }
+
+    // Optional end-of-turn token. Falls back to config.eos_token alone if the
+    // tokenizer doesn't register `<end_of_turn>` as a special.
+    let eot_id = tokenizer.special_token_id("<end_of_turn>");
+
+    // Prefill — per-token forward into both KV caches.
+    let kv_sliding = m.gemma4_kv_sliding.as_mut().expect("gemma4 kv_sliding");
+    let kv_full = m.gemma4_kv_full.as_mut().expect("gemma4 kv_full");
+    let prefill_start = Instant::now();
+    let prefill_len = prompt_tokens.len();
+    for (i, &tok) in prompt_tokens.iter().enumerate() {
+        let pos = m.seq_pos + i;
+        if let Err(e) = gemma4::forward_scratch(
+            gpu, weights, config, tok, pos, kv_sliding, kv_full, scratch,
+        ) {
+            let _ = writeln!(stdout,
+                r#"{{"type":"error","id":"{}","message":"gemma4 prefill forward: {}"}}"#, id, e);
+            let _ = stdout.flush();
+            return;
+        }
+        m.conversation_tokens.push(tok);
+    }
+    m.seq_pos += prefill_len;
+    let prefill_elapsed = prefill_start.elapsed().as_secs_f64();
+
+    // Sampler config — `Gemma4Scratch` exposes logits/sample_buf/repeat_buf.
+    let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;
+    let cfg = SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window: repeat_window.min(repeat_buf_cap),
+        blocked_tokens: Vec::new(),
+    };
+    let mut rng_state: u32 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() as u32).wrapping_add(1))
+        .unwrap_or(0xC0FFEE);
+
+    let mut next_token = sampler::sample(
+        gpu, &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+        config.vocab_size, &m.conversation_tokens, &cfg, &mut rng_state,
+    );
+
+    let decode_start = Instant::now();
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
+    let mut filter = EosFilter::new(EosFilterConfig::default());
+
+    for step in 0..max_tokens {
+        // Terminator?
+        if next_token == config.eos_token { break; }
+        if eot_id == Some(next_token) { break; }
+        if tokenizer.is_terminator(next_token) { break; }
+
+        // Commit + stream the token text.
+        m.conversation_tokens.push(next_token);
+        streamed_tokens.push(next_token);
+        emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1,
+            t0.elapsed().as_millis() as u64);
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[bytes_fed_to_filter..];
+        bytes_fed_to_filter = all_bytes.len();
+        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+            let text = std::str::from_utf8(&text_bytes).unwrap_or("");
+            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#,
+                id, serde_json::to_string(&text).unwrap_or_default());
+            let _ = stdout.flush();
+        }
+
+        // Advance KV by feeding the just-committed token.
+        let pos = m.seq_pos;
+        if let Err(e) = gemma4::forward_scratch(
+            gpu, weights, config, next_token, pos, kv_sliding, kv_full, scratch,
+        ) {
+            let _ = writeln!(stdout,
+                r#"{{"type":"error","id":"{}","message":"gemma4 decode forward: {}"}}"#, id, e);
+            let _ = stdout.flush();
+            return;
+        }
+        m.seq_pos += 1;
+
+        // Sample next.
+        next_token = sampler::sample(
+            gpu, &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+            config.vocab_size, &m.conversation_tokens, &cfg, &mut rng_state,
+        );
+
+        // Hard context cap — break before overflowing max_seq even if the model
+        // hasn't emitted EOS.
+        if m.seq_pos + 1 >= m.max_seq {
+            eprintln!("[daemon] gemma4 hit max_seq={} after {} decode steps", m.max_seq, step + 1);
+            break;
+        }
+    }
+
+    // Flush any pending text from the EosFilter (matches the qwen35 path).
+    if filter.has_pending() {
+        let text_bytes = filter.flush_pending();
+        let text = std::str::from_utf8(&text_bytes).unwrap_or("");
+        if !text.is_empty() {
+            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#,
+                id, serde_json::to_string(&text).unwrap_or_default());
+        }
+    }
+
+    let total_s = t0.elapsed().as_secs_f64();
+    let decode_elapsed = decode_start.elapsed().as_secs_f64();
+    let generated = streamed_tokens.len();
+    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+    let prefill_tok_s = if prefill_elapsed > 0.0 { prefill_len as f64 / prefill_elapsed } else { 0.0 };
+    let decode_tok_s = if decode_elapsed > 0.0 && generated > 0 { generated as f64 / decode_elapsed } else { 0.0 };
+    let _ = writeln!(stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.2},"prefill_tok_s":{:.1},"decode_tok_s":{:.1}}}"#,
+        id, generated, tok_s, prefill_len, prefill_elapsed * 1000.0, prefill_tok_s, decode_tok_s);
+    let _ = stdout.flush();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
+    // Gemma 4 dispatch — minimal AR path, no DFlash/multi-GPU/PFlash/tools.
+    // Silently ignores qwen-specific knobs (budgets, think-cap, tools history).
+    if m.arch_id == 7 {
+        let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens, assistant_prefix,
+                 pflash_state, pflash_cfg, tools, messages_history);
+        generate_gemma4(m, gpu, stdout, id, prompt, system_prompt, temp, top_p,
+                        max_tokens, repeat_penalty, repeat_window);
+        return;
+    }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.

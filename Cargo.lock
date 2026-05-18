@@ -733,6 +733,7 @@ version = "0.1.20"
 dependencies = [
  "byteorder",
  "hip-bridge",
+ "hipfire-arch-gemma4",
  "hipfire-arch-llama",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
