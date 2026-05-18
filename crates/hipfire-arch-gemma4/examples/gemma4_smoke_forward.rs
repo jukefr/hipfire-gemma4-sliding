@@ -151,6 +151,22 @@ fn main() {
                 tokenizer.decode(&[pid]).replace('\n', "\\n"), rank, logit);
         }
     }
+    // Quick histogram of the logit distribution: how many tokens are saturated?
+    let cap = config.final_logit_softcapping.max(30.0);
+    let n_neg_sat = logits.iter().filter(|&&v| v < -cap * 0.95).count();
+    let n_pos_sat = logits.iter().filter(|&&v| v > cap * 0.95).count();
+    let n_mid_pos = logits.iter().filter(|&&v| v > 0.0 && v < cap * 0.5).count();
+    let n_mid_neg = logits.iter().filter(|&&v| v < 0.0 && v > -cap * 0.5).count();
+    eprintln!("  logits histogram (cap={cap}): pos_saturated={n_pos_sat} neg_saturated={n_neg_sat} mid_pos<{}={n_mid_pos} mid_neg>{}={n_mid_neg}",
+        cap*0.5, -cap*0.5);
+    // Median, p10, p90 of |logit|
+    let mut absvals: Vec<f32> = logits.iter().map(|v| v.abs()).collect();
+    absvals.sort_by(|a,b| a.partial_cmp(b).unwrap());
+    let p10 = absvals[absvals.len() / 10];
+    let p50 = absvals[absvals.len() / 2];
+    let p90 = absvals[absvals.len() * 9 / 10];
+    let p99 = absvals[absvals.len() * 99 / 100];
+    eprintln!("  |logit| percentiles: p10={p10:.4} p50={p50:.4} p90={p90:.4} p99={p99:.4}");
 
     if n_steps > 1 {
         eprintln!("\n=== decoding {} more tokens greedily ===", n_steps - 1);
