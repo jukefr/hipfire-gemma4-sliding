@@ -16289,7 +16289,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.attention_flash_asym3_window(
             q, k_cache, v_cache, out, pos_buf, cos_theta, sin_theta,
-            seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0,
+            seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0, 0,
         )
     }
 
@@ -16297,13 +16297,25 @@ impl Gpu {
     /// is identical to the full-causal path. Used by Gemma 4 sliding layers
     /// (head_dim=256) AND full layers (head_dim=512, dispatches the 16-dim/
     /// thread variant — origin/gemma4 6f5cb8b).
+    ///
+    /// `cache_capacity > 0` enables ring-buffer slot reads (slot = t %
+    /// cache_capacity). Only supported on hd=256 (sliding layers); hd=512
+    /// rejects cache_capacity > 0 since the hd512 kernel has not been
+    /// patched (full layers use direct-pos addressing).
     pub fn attention_flash_asym3_window(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, pos_buf: &DeviceBuffer,
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
-        partials: &GpuTensor, window_size: u32,
+        partials: &GpuTensor, window_size: u32, cache_capacity: u32,
     ) -> HipResult<()> {
+        if head_dim == 512 && cache_capacity > 0 {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "attention_flash_asym3_window: cache_capacity={} not supported on \
+                 head_dim=512 (hd512 kernel not patched — full layers use direct \
+                 pos addressing)", cache_capacity
+            )));
+        }
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
@@ -16351,6 +16363,7 @@ impl Gpu {
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
             let mut ws = window_size as i32;
+            let mut cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -16368,6 +16381,12 @@ impl Gpu {
                 &mut mt as *mut _ as *mut c_void,
                 &mut ws as *mut _ as *mut c_void,
             ];
+            // hd=256 kernel (attention_flash_asym3_tile) accepts the trailing
+            // cache_capacity arg; hd=512 (attention_flash_asym3_tile_hd512)
+            // does not (back-compat — full layers don't ring-buffer).
+            if head_dim == 256 {
+                params.push(&mut cc as *mut _ as *mut c_void);
+            }
             unsafe {
                 self.hip.launch_kernel(
                     func,

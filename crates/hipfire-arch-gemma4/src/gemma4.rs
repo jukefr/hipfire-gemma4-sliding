@@ -1258,6 +1258,7 @@ fn sliding_layer_decode(
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
             config.sliding_window as u32,
+            0,
         )?;
     } else if kv_cache.quant_asym4 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -1434,7 +1435,8 @@ fn full_layer_decode(
             &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
-            0, // window_size: full causal
+            0, // window_size: full causal,
+            0,
         )?;
     } else if kv_cache.quant_asym4 || kv_cache.quant_asym2 || kv_cache.quant_q8 {
         let mode = if kv_cache.quant_asym4 { "asym4" }
