@@ -3342,18 +3342,12 @@ fn generate_gemma4(
     let has_structured = tools.is_some() || messages_history.is_some();
     let try_jinja = (has_structured || jinja_env) && m.chat_template.is_some();
 
-    // Multi-turn via Jinja re-prefills the full history each request — reset
-    // KV state before encoding. Single-turn prompts (no messages_history)
-    // continue to append to conversation_tokens for cross-turn caching.
-    let multi_turn_reset = try_jinja && has_structured;
-    if multi_turn_reset {
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        if let Some(kv) = m.gemma4_kv_sliding.as_mut() { kv.compact_offset = 0; }
-        if let Some(kv) = m.gemma4_kv_full.as_mut() { kv.compact_offset = 0; }
-    }
-
-    let prompt_tokens: Vec<u32> = if try_jinja {
+    // Build the full expected token sequence for this request. For structured
+    // requests this represents the entire conversation rendered from scratch;
+    // for legacy single-turn requests it's the standalone prompt scaffold.
+    // The decision of how to align against existing cache state (LCP-match
+    // vs. append-delta) happens below.
+    let full_prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
@@ -3413,12 +3407,50 @@ fn generate_gemma4(
                                tools, messages_history)
     };
 
+    // Align against existing cache state.
+    //
+    // Structured requests carry the FULL conversation each turn; do an
+    // LCP-match against m.conversation_tokens so any matching prefix
+    // (BOS + earlier turns the client echoed back unchanged) skips
+    // prefill. KV slots past the LCP boundary become stale but won't
+    // be read — attention scans [0, seq_pos] and we reset seq_pos to
+    // the LCP length before writing the new tail.
+    //
+    // Legacy single-turn requests are an append-delta protocol: the
+    // request carries only the new user turn, and m.conversation_tokens
+    // already holds the prior turns. Prefill the whole built prompt
+    // (which for seq_pos > 0 already excludes BOS via the build path
+    // below) after whatever's cached.
+    let tokens_to_prefill: Vec<u32> = if has_structured {
+        let lcp = full_prompt_tokens.iter()
+            .zip(m.conversation_tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if lcp < m.seq_pos {
+            // Truncate cache state back to the agreement boundary. Slots in
+            // KV beyond `lcp` hold stale values from the previous run; they
+            // become unread the moment we reset seq_pos here.
+            m.seq_pos = lcp;
+            m.conversation_tokens.truncate(lcp);
+            if let Some(kv) = m.gemma4_kv_sliding.as_mut() { kv.compact_offset = 0; }
+            if let Some(kv) = m.gemma4_kv_full.as_mut() { kv.compact_offset = 0; }
+        }
+        if lcp > 0 {
+            eprintln!("[daemon] gemma4 cross-request cache: matched {} prefix tokens, prefilling {} new",
+                lcp, full_prompt_tokens.len() - lcp);
+        }
+        full_prompt_tokens[lcp..].to_vec()
+    } else {
+        // Legacy path — full_prompt_tokens is just this turn's user scaffold.
+        full_prompt_tokens
+    };
+
     // Reset on overflow. Full-context KV is at max_seq slots; sliding ring-
     // buffers don't need this guard.
-    let est_total = m.seq_pos + prompt_tokens.len() + max_tokens;
+    let est_total = m.seq_pos + tokens_to_prefill.len() + max_tokens;
     if est_total > m.max_seq {
         eprintln!("[daemon] gemma4 context full ({}+{}+{}>{}) — resetting conversation",
-            m.seq_pos, prompt_tokens.len(), max_tokens, m.max_seq);
+            m.seq_pos, tokens_to_prefill.len(), max_tokens, m.max_seq);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         if let Some(kv) = m.gemma4_kv_sliding.as_mut() { kv.compact_offset = 0; }
@@ -3434,12 +3466,14 @@ fn generate_gemma4(
     // ships <end_of_turn> as a literal special.
     let alt_eot = tokenizer.special_token_id("<end_of_turn>");
 
-    // Prefill — per-token forward into both KV caches.
+    // Prefill — per-token forward into both KV caches. With cross-request
+    // KV caching, prefill_len is the *new* tokens only; matched-prefix
+    // tokens are already in the cache from prior requests.
     let kv_sliding = m.gemma4_kv_sliding.as_mut().expect("gemma4 kv_sliding");
     let kv_full = m.gemma4_kv_full.as_mut().expect("gemma4 kv_full");
     let prefill_start = Instant::now();
-    let prefill_len = prompt_tokens.len();
-    for (i, &tok) in prompt_tokens.iter().enumerate() {
+    let prefill_len = tokens_to_prefill.len();
+    for (i, &tok) in tokens_to_prefill.iter().enumerate() {
         let pos = m.seq_pos + i;
         if let Err(e) = gemma4::forward_scratch(
             gpu, weights, config, tok, pos, kv_sliding, kv_full, scratch,
@@ -3478,12 +3512,15 @@ fn generate_gemma4(
     let mut bytes_fed_to_filter = 0usize;
     let mut filter = EosFilter::new(EosFilterConfig::default());
 
+    // Track how we exited the decode loop so we can decide whether to commit
+    // a synthetic <turn|> for cross-request alignment.
+    let mut exited_on_eot: Option<u32> = None;
     for step in 0..max_tokens {
         // Terminator?
-        if next_token == config.eos_token { break; }
-        if eot_id == Some(next_token) { break; }
-        if alt_eot == Some(next_token) { break; }
-        if tokenizer.is_terminator(next_token) { break; }
+        if next_token == config.eos_token { exited_on_eot = Some(next_token); break; }
+        if eot_id == Some(next_token) { exited_on_eot = Some(next_token); break; }
+        if alt_eot == Some(next_token) { exited_on_eot = Some(next_token); break; }
+        if tokenizer.is_terminator(next_token) { exited_on_eot = Some(next_token); break; }
 
         // Commit + stream the token text.
         m.conversation_tokens.push(next_token);
@@ -3534,6 +3571,28 @@ fn generate_gemma4(
             let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#,
                 id, serde_json::to_string(&text).unwrap_or_default());
         }
+    }
+
+    // Cache-alignment commit: persist the <turn|> boundary into the cache
+    // so the next request's LCP-match aligns correctly. Two cases:
+    //   - Natural EOT: the model sampled `<turn|>` and we broke without
+    //     committing it (so it wasn't forwarded). Forward + push it now
+    //     so conversation_tokens ends exactly where the next turn begins.
+    //   - max_tokens cut-off: synthesize a <turn|> close to bound the
+    //     assistant turn; without this the next request's user-turn
+    //     scaffold would graft onto an unterminated model turn and
+    //     diverge from the canonical Gemma 4 stream.
+    let eot_to_commit = exited_on_eot
+        .or(eot_id)
+        .or(alt_eot)
+        .unwrap_or(config.eos_token);
+    if let Err(e) = gemma4::forward_scratch(
+        gpu, weights, config, eot_to_commit, m.seq_pos, kv_sliding, kv_full, scratch,
+    ) {
+        eprintln!("[daemon] gemma4 trailer eot forward: {e}");
+    } else {
+        m.conversation_tokens.push(eot_to_commit);
+        m.seq_pos += 1;
     }
 
     let total_s = t0.elapsed().as_secs_f64();
