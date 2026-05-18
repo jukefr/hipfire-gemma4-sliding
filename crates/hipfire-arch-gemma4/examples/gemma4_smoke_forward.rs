@@ -135,38 +135,15 @@ fn main() {
         eprintln!("  softcap check: |logit| <= {cap} — PASS");
     }
 
-    // Top-5 argmax + full sort to compute ranks of arbitrary probe tokens.
+    // Top-5 argmax.
     let mut indexed: Vec<(u32, f32)> = logits.iter().enumerate()
         .map(|(i, &v)| (i as u32, v)).collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    eprintln!("  top-10 tokens: {:?}", &indexed[..10]);
+    indexed.select_nth_unstable_by(4, |a, b| b.1.partial_cmp(&a.1).unwrap());
+    indexed[..5].sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    eprintln!("  top-5 tokens: {:?}", &indexed[..5]);
     let argmax = indexed[0].0;
     eprintln!("  argmax = {argmax}  decoded = '{}'  (elapsed: {:?})",
         tokenizer.decode(&[argmax]).replace('\n', "\\n"), elapsed);
-    if let Ok(probe) = std::env::var("HIPFIRE_PROBE_TOKEN") {
-        if let Ok(pid) = probe.parse::<u32>() {
-            let rank = indexed.iter().position(|(i, _)| *i == pid).unwrap_or(usize::MAX);
-            let logit = logits.get(pid as usize).copied().unwrap_or(f32::NAN);
-            eprintln!("  PROBE token {pid} decoded='{}' rank={} logit={:.4}",
-                tokenizer.decode(&[pid]).replace('\n', "\\n"), rank, logit);
-        }
-    }
-    // Quick histogram of the logit distribution: how many tokens are saturated?
-    let cap = config.final_logit_softcapping.max(30.0);
-    let n_neg_sat = logits.iter().filter(|&&v| v < -cap * 0.95).count();
-    let n_pos_sat = logits.iter().filter(|&&v| v > cap * 0.95).count();
-    let n_mid_pos = logits.iter().filter(|&&v| v > 0.0 && v < cap * 0.5).count();
-    let n_mid_neg = logits.iter().filter(|&&v| v < 0.0 && v > -cap * 0.5).count();
-    eprintln!("  logits histogram (cap={cap}): pos_saturated={n_pos_sat} neg_saturated={n_neg_sat} mid_pos<{}={n_mid_pos} mid_neg>{}={n_mid_neg}",
-        cap*0.5, -cap*0.5);
-    // Median, p10, p90 of |logit|
-    let mut absvals: Vec<f32> = logits.iter().map(|v| v.abs()).collect();
-    absvals.sort_by(|a,b| a.partial_cmp(b).unwrap());
-    let p10 = absvals[absvals.len() / 10];
-    let p50 = absvals[absvals.len() / 2];
-    let p90 = absvals[absvals.len() * 9 / 10];
-    let p99 = absvals[absvals.len() * 99 / 100];
-    eprintln!("  |logit| percentiles: p10={p10:.4} p50={p50:.4} p90={p90:.4} p99={p99:.4}");
 
     if n_steps > 1 {
         eprintln!("\n=== decoding {} more tokens greedily ===", n_steps - 1);
