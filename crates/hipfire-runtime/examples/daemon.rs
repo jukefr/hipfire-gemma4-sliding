@@ -3512,7 +3512,7 @@ fn generate_gemma4(
     // through to the per-token loop (which also handles correctness gracefully
     // for non-MoE Gemma 4 variants).
     const PREFILL_BATCH_THRESHOLD: usize = 16;
-    const PREFILL_BATCH_SIZE: usize = 64;
+    const PREFILL_BATCH_SIZE: usize = 128;
     let use_batched = prefill_len >= PREFILL_BATCH_THRESHOLD
         && std::env::var("HIPFIRE_PREFILL_BATCH").ok().as_deref() != Some("0");
     if use_batched {

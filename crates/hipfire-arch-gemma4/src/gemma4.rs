@@ -1000,11 +1000,9 @@ impl Gemma4Scratch {
         let moe_expert_up_batch   = gpu.zeros(&[k_top * mi], DType::F32)?;
         let moe_expert_hidden_batch = gpu.zeros(&[k_top * mi], DType::F32)?;
 
-        // Prefill-batch scratch (N tokens at once). MAX_PREFILL_BATCH=64
-        // is a tuning constant — larger batches mean more concurrent GPU
-        // work but proportionally more VRAM. 64 × dim=2816 × f32 = 720 KB
-        // for the main residual; total batch scratch ≈ 10 MB.
-        const MAX_PREFILL_BATCH: usize = 64;
+        // Prefill-batch scratch (N tokens at once). Larger batches expose
+        // more concurrent GPU work — total batch scratch ≈ N*0.16 MB.
+        const MAX_PREFILL_BATCH: usize = 128;
         let pb_attn_out          = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
         let pb_ffn_out           = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
         let pb_moe_pre2          = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
