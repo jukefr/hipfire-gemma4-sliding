@@ -16580,9 +16580,11 @@ impl Gpu {
     }
 
     /// Batched flash attention for asym3 with sliding window + ring buffer.
-    /// Gemma 4 sliding-layer prefill: window_size = 1024, cache_capacity = 1024.
-    /// Replaces the per-token attention_flash_asym3_window loop inside
-    /// forward_prefill_batch_v2; eliminates 30*n_batch micro-launches per chunk.
+    /// Gemma 4 sliding-layer prefill: head_dim=256, window_size=1024,
+    /// cache_capacity=1024. Full-layer prefill: head_dim=512, window_size=0,
+    /// cache_capacity=0 (no ring; direct slot addressing).
+    /// Replaces the per-token attention loop inside forward_prefill_batch_v2;
+    /// eliminates 30*n_batch micro-launches per chunk.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym3_batched_window(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -16595,10 +16597,23 @@ impl Gpu {
         cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let (key, src, fname) = match head_dim {
+            256 => (
+                "attention_flash_asym3_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
+                "attention_flash_asym3_tile_batched",
+            ),
+            512 => (
+                "attention_flash_asym3_tile_hd512_batched",
+                kernels::ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC,
+                "attention_flash_asym3_tile_hd512_batched",
+            ),
+            _ => return Err(hip_bridge::HipError::new(0, &format!(
+                "attention_flash_asym3_batched_window: unsupported head_dim={} (only 256, 512)", head_dim
+            ))),
+        };
         self.launch_asym_flash_batched(
-            "attention_flash_asym3_tile_batched",
-            kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
-            "attention_flash_asym3_tile_batched",
+            key, src, fname,
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             None, 0, 0,

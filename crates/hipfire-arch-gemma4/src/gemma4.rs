@@ -2559,46 +2559,27 @@ fn forward_prefill_batch_v2(
                     }
                 }
 
-                for i in 0..n_batch {
-                    let pos = start_pos + i;
-                    if let Some(stream) = gpu.active_stream.as_ref() {
-                        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
-                    } else {
-                        let pos_i32 = pos as i32;
-                        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-                    }
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
-                    }
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                    }
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                    }
-                    let ct = kv_full.givens_cos.as_ref().unwrap();
-                    let st = kv_full.givens_sin.as_ref().unwrap();
-                    gpu.kv_cache_write_asym3_fused(
-                        &kv_full.k_gpu[full_kv_idx], &kv_full.v_gpu[full_kv_idx],
-                        &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim, 0)?;
-                    gpu.attention_flash_asym3_window(
-                        &scratch.q, &kv_full.k_gpu[full_kv_idx], &kv_full.v_gpu[full_kv_idx],
-                        &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
-                        n_heads, n_kv, head_dim, kv_full.max_seq,
-                        &scratch.flash_partials, 0, 0,
-                    )?;
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes)?;
-                    }
-                }
+                // Batched KV write + attention for full layer (hd=512).
+                // cache_capacity=0 — full layers don't ring-buffer; they
+                // address KV slots directly by absolute position.
+                let ct = kv_full.givens_cos.as_ref().unwrap();
+                let st = kv_full.givens_sin.as_ref().unwrap();
+                gpu.kv_cache_write_asym3_batched(
+                    &kv_full.k_gpu[full_kv_idx], &kv_full.v_gpu[full_kv_idx],
+                    &scratch.pb_k, &scratch.pb_v, &scratch.pb_positions,
+                    ct, st, n_kv, head_dim, n_batch, 0,
+                )?;
+                let max_ctx_len = start_pos + n_batch;
+                gpu.attention_flash_asym3_batched_window(
+                    &scratch.pb_q,
+                    &kv_full.k_gpu[full_kv_idx], &kv_full.v_gpu[full_kv_idx],
+                    &scratch.pb_q,
+                    &scratch.pb_positions, ct, st,
+                    n_heads, n_kv, head_dim,
+                    kv_full.max_seq, max_ctx_len, n_batch,
+                    &scratch.flash_partials,
+                    0, 0, // window_size=0, cache_capacity=0
+                )?;
                 full_kv_idx += 1;
 
                 weight_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
