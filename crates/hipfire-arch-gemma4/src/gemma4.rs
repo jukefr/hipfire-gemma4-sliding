@@ -900,6 +900,10 @@ pub struct Gemma4Scratch {
     pub pb_moe_topk_indices: GpuTensor,
     /// `[N × k_top]` — renormalized top-K weights per token.
     pub pb_moe_topk_weights: GpuTensor,
+    /// `[n_exp + 1]` i32 — prefix-sum bucket offsets for routing-bucketed MoE GEMM.
+    pub pb_moe_expert_offsets: GpuTensor,
+    /// `[N × k_top]` i32 — packed (token_idx × k_top + krank), sorted by expert.
+    pub pb_moe_expert_token_list: GpuTensor,
     /// `[N × k_top × mi]` — gate output across tokens × experts.
     pub pb_moe_gate_batch: GpuTensor,
     /// `[N × k_top × mi]` — up output across tokens × experts.
@@ -1027,6 +1031,10 @@ impl Gemma4Scratch {
         let pb_moe_router_logits = gpu.zeros(&[MAX_PREFILL_BATCH, n_exp], DType::F32)?;
         let pb_moe_topk_indices  = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
         let pb_moe_topk_weights  = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
+        // Routing-bucket scratch (Phase B). expert_offsets has n_exp+1 entries.
+        // expert_token_list has one entry per (token, krank) pair = N × k_top.
+        let pb_moe_expert_offsets    = gpu.zeros(&[n_exp + 1], DType::F32)?;  // i32-typed slots
+        let pb_moe_expert_token_list = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
         let pb_moe_gate_batch    = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
         let pb_moe_up_batch      = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
         let pb_moe_hidden_batch  = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
@@ -1066,6 +1074,7 @@ impl Gemma4Scratch {
             pb_moe_pre2, pb_moe_pre2_rot,
             pb_moe_router_in, pb_moe_router_logits,
             pb_moe_topk_indices, pb_moe_topk_weights,
+            pb_moe_expert_offsets, pb_moe_expert_token_list,
             pb_moe_gate_batch, pb_moe_up_batch, pb_moe_hidden_batch,
             pb_moe_cur_moe, pb_moe_cur_mlp, pb_residual,
             pb_tmp, pb_q, pb_k, pb_v, pb_gate, pb_up, pb_ffn_hidden,
@@ -1120,6 +1129,8 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.pb_moe_router_logits);
         let _ = gpu.free_tensor(self.pb_moe_topk_indices);
         let _ = gpu.free_tensor(self.pb_moe_topk_weights);
+        let _ = gpu.free_tensor(self.pb_moe_expert_offsets);
+        let _ = gpu.free_tensor(self.pb_moe_expert_token_list);
         let _ = gpu.free_tensor(self.pb_moe_gate_batch);
         let _ = gpu.free_tensor(self.pb_moe_up_batch);
         let _ = gpu.free_tensor(self.pb_moe_hidden_batch);
@@ -1420,19 +1431,52 @@ fn apply_moe_branch_batched(
         n_batch,
     )?;
 
+    // 5b) Phase B (opt-in): build per-expert buckets so the bucketed GEMV
+    // can reuse the weight tile across all tokens routed to the same expert.
+    // Measured -5.7% prefill regression on Gemma 4 26B-A4B-it / gfx1201 at
+    // N=128 batch (132 → 124 tok/s): the bucketed kernel pre-loads the
+    // weight tile into ~48 VGPRs per lane (sc/zp/pk × 16 groups) which
+    // cuts occupancy below the indexed_batched kernel that streams weights
+    // in the inner loop, and the serialized loop over bucket tokens loses
+    // more parallelism than is recovered from launch-overhead savings
+    // (180k blocks vs 1.4M). Default OFF; kept behind opt-in for future
+    // tuning (smaller MAX_GROUPS, LDS staging, fewer launch_bounds waves).
+    let use_bucketed = std::env::var("HIPFIRE_MOE_BUCKETED")
+        .ok().map(|v| v == "1").unwrap_or(false);
+    if use_bucketed {
+        gpu.moe_bucket_build(
+            &scratch.pb_moe_topk_indices,
+            &scratch.pb_moe_expert_offsets,
+            &scratch.pb_moe_expert_token_list,
+            n_batch, k_top, n_exp,
+        )?;
+    }
+
     // 6) Pre-rotate pre2_batch via FWHT (MQ4 indexed gate_up expects rotated x).
     gpu.rotate_x_mq_batched(&scratch.pb_moe_pre2, &scratch.pb_moe_pre2_rot,
         dim, n_batch)?;
 
-    // 7) Batched indexed gate_up — one launch for N × K_TOP × MI outputs.
-    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-        &moe.experts_gate_up_ptrs,
-        &scratch.pb_moe_topk_indices,
-        &scratch.pb_moe_pre2_rot,
-        &scratch.pb_moe_gate_batch,
-        &scratch.pb_moe_up_batch,
-        2 * mi, dim, k_top, n_batch,
-    )?;
+    // 7) Bucketed (or indexed_batched fallback) gate_up — one launch.
+    if use_bucketed {
+        gpu.gemv_mq4g256_moe_gate_up_bucketed(
+            &moe.experts_gate_up_ptrs,
+            &scratch.pb_moe_expert_offsets,
+            &scratch.pb_moe_expert_token_list,
+            &scratch.pb_moe_pre2_rot,
+            &scratch.pb_moe_gate_batch,
+            &scratch.pb_moe_up_batch,
+            2 * mi, dim, k_top, n_exp,
+        )?;
+    } else {
+        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+            &moe.experts_gate_up_ptrs,
+            &scratch.pb_moe_topk_indices,
+            &scratch.pb_moe_pre2_rot,
+            &scratch.pb_moe_gate_batch,
+            &scratch.pb_moe_up_batch,
+            2 * mi, dim, k_top, n_batch,
+        )?;
+    }
 
     // 8) Batched gelu_tanh + mul over [N × K_TOP × MI].
     gpu.gelu_tanh_f32(&scratch.pb_moe_gate_batch,
@@ -1449,16 +1493,29 @@ fn apply_moe_branch_batched(
         gpu.hip.memset(&scratch.pb_moe_cur_moe.buf, 0, n_batch * dim_bytes)?;
     }
 
-    // 10) Batched indexed down + scaled residual. atomicAdd into pb_moe_cur_moe.
-    gpu.gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(
-        &moe.experts_down_ptrs,
-        &scratch.pb_moe_topk_indices,
-        &scratch.pb_moe_topk_weights,
-        &moe.per_expert_scale,
-        &scratch.pb_moe_hidden_batch,
-        &scratch.pb_moe_cur_moe,
-        dim, mi, k_top, n_batch,
-    )?;
+    // 10) Bucketed (or indexed_batched fallback) down + scaled residual.
+    if use_bucketed {
+        gpu.gemv_hfq4g128_moe_down_residual_scaled_bucketed(
+            &moe.experts_down_ptrs,
+            &scratch.pb_moe_expert_offsets,
+            &scratch.pb_moe_expert_token_list,
+            &scratch.pb_moe_topk_weights,
+            &moe.per_expert_scale,
+            &scratch.pb_moe_hidden_batch,
+            &scratch.pb_moe_cur_moe,
+            dim, mi, k_top, n_exp,
+        )?;
+    } else {
+        gpu.gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(
+            &moe.experts_down_ptrs,
+            &scratch.pb_moe_topk_indices,
+            &scratch.pb_moe_topk_weights,
+            &moe.per_expert_scale,
+            &scratch.pb_moe_hidden_batch,
+            &scratch.pb_moe_cur_moe,
+            dim, mi, k_top, n_batch,
+        )?;
+    }
 
     // 11) post_feedforward_layernorm_2(cur_moe) in-place batched.
     gpu.rmsnorm_batched(&scratch.pb_moe_cur_moe, &moe.post_feedforward_layernorm_2,

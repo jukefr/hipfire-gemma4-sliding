@@ -485,6 +485,26 @@ pub const GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched.hip");
 
+/// Phase B1: build routing buckets. Sorts (token, krank) pairs by expert id
+/// to enable bucketed-by-expert MoE GEMM where the weight tile is loaded
+/// once per (row, expert) and reused across the bucket of tokens routed to
+/// that expert. Single-block kernel; n_exp ≤ 256.
+pub const MOE_BUCKET_BUILD_SRC: &str =
+    include_str!("../../../kernels/src/moe_bucket_build.hip");
+
+/// Phase B2: routing-bucketed HFQ4G256 MoE gate_up. Grid (M, n_exp); each
+/// block holds the weight tile for one (row, expert) in registers and walks
+/// the bucket of tokens routed to that expert. Replaces the per-(M, K_TOP, N)
+/// indexed_batched variant for prefill batches with N >= threshold.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_BUCKETED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_bucketed.hip");
+
+/// Phase B3: routing-bucketed HFQ4G128 MoE down + scaled residual. Mirrors
+/// the bucketed gate_up. Each block atomicAdd-s into x_residual for every
+/// token in its bucket, scaled by topk_weights × per_expert_scale.
+pub const GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_BUCKETED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_moe_down_residual_scaled_bucketed.hip");
+
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
 /// layer; one workgroup per token. Enables batched MoE prefill.

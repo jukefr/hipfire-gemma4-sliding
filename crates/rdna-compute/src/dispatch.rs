@@ -9314,6 +9314,178 @@ impl Gpu {
         )
     }
 
+    /// Phase B1: routing bucket builder. Sorts (token, krank) pairs by
+    /// expert id so the gate_up / down kernels can amortize weight loads
+    /// across multiple tokens that route to the same expert. Single-block
+    /// kernel; n_exp ≤ 256.
+    pub fn moe_bucket_build(
+        &mut self,
+        topk_indices: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        n_batch: usize, k_top: usize, n_exp: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_bucket_build",
+            kernels::MOE_BUCKET_BUILD_SRC,
+            "moe_bucket_build",
+        )?;
+        let ip = topk_indices.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let lp = expert_token_list.buf.as_ptr();
+        let n_val = n_batch as i32;
+        let kt_val = k_top as i32;
+        let ne_val = n_exp as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "moe_bucket_build",
+            [1, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip); b.push_ptr(op); b.push_ptr(lp);
+                b.push_i32(n_val); b.push_i32(kt_val); b.push_i32(ne_val);
+                b
+            },
+        )
+    }
+
+    /// Phase B2: routing-bucketed HFQ4G256 MoE gate_up. Grid (M, n_exp).
+    /// Reuses the weight tile for each (row, expert) across all tokens
+    /// routed to that expert. For MQ4G256 weights, the caller is
+    /// responsible for the FWHT pre-rotation of `x`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g256_moe_gate_up_bucketed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up:   &GpuTensor,
+        m: usize, k: usize, k_top: usize, n_exp: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_moe_gate_up_bucketed",
+            kernels::GEMV_HFQ4G256_MOE_GATE_UP_BUCKETED_SRC,
+            "gemv_hfq4g256_moe_gate_up_bucketed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let lp = expert_token_list.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_hfq4g256_moe_gate_up_bucketed",
+            [m as u32, n_exp as u32, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(op); b.push_ptr(lp);
+                b.push_ptr(xp); b.push_ptr(ygp); b.push_ptr(yup);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
+    /// Phase B2 wrapper: MQ4G256 bucketed gate_up. Reuses the HFQ4G256
+    /// bucketed kernel; caller is responsible for pre-rotating `x` via FWHT.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq4g256_moe_gate_up_bucketed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up:   &GpuTensor,
+        m: usize, k: usize, k_top: usize, n_exp: usize,
+    ) -> HipResult<()> {
+        self.gemv_hfq4g256_moe_gate_up_bucketed(
+            expert_ptrs, expert_offsets, expert_token_list,
+            x_rot, y_gate, y_up, m, k, k_top, n_exp,
+        )
+    }
+
+    /// Phase B3: routing-bucketed HFQ4G128 MoE down + scaled residual.
+    /// Grid (M, n_exp). Each block atomicAdd-s into x_residual for every
+    /// token in its bucket, scaled by topk_weights × per_expert_scale.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g128_moe_down_residual_scaled_bucketed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize, k: usize, k_top: usize, n_exp: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g128_moe_down_residual_scaled_bucketed",
+            kernels::GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_BUCKETED_SRC,
+            "gemv_hfq4g128_moe_down_residual_scaled_bucketed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let lp = expert_token_list.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let pesp = per_expert_scale.buf.as_ptr();
+        let hbp = hidden_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &pesp as *const _ as *mut c_void,
+            &hbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_hfq4g128_moe_down_residual_scaled_bucketed",
+            [m as u32, n_exp as u32, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(op); b.push_ptr(lp);
+                b.push_ptr(wp); b.push_ptr(pesp); b.push_ptr(hbp); b.push_ptr(xrp);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
     /// Gemma 4 MoE gate_up MQ4G256/MG4G256 indexed dispatch. The MQ4 GEMV
     /// inner loop is byte-identical to HFQ4G256's (same 136 B groups);
     /// the only difference is the caller pre-rotates x via FWHT once
