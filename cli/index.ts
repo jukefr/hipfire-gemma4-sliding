@@ -994,7 +994,17 @@ class Engine {
     const bin = bins.find(p => existsSync(p));
     if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p hipfire-runtime");
 
-    this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: { ...process.env } });
+    // Auto-size HIPFIRE_KV_SEQ to match the config's max_seq when not
+    // explicitly set. Gemma 4's `Gemma4Scratch::new` sizes the flash_partials
+    // buffer from this env var (falling back to 32k), so on a 65k+ max_seq
+    // load the kernel would error out with "partials too small" if the env
+    // wasn't matched. Other arches ignore the var.
+    const daemonCfg = loadConfig();
+    const envWithKvSeq: Record<string, string> = { ...process.env } as any;
+    if (!envWithKvSeq.HIPFIRE_KV_SEQ) {
+      envWithKvSeq.HIPFIRE_KV_SEQ = String(daemonCfg.max_seq);
+    }
+    this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: envWithKvSeq });
     const stdout = this.proc.stdout;
     if (!stdout || typeof stdout === "number") throw new Error("daemon stdout pipe unavailable");
     this.reader = stdout.getReader();
