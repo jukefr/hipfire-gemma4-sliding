@@ -11,7 +11,17 @@
 # across 3 samples vs 7689-7806 post-#135; the diff is purely additive at
 # the dispatch level on RDNA4, ruling out a real code regression.
 #
-# Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
+# Config: KV=asym3. HIPFIRE_GRAPH is documented as ON for 4B/9B/27B here,
+# but as of 2026-05-19 on ROCm 7.2 / gfx1201, hipGraph capture is a net
+# perf REGRESSION on this hardware: Qwen 9B mq4 decode 93 -> 68 tok/s
+# graph-on, Gemma 4 26B-A4B decode 71 -> 39 tok/s graph-on. The graph
+# executor's per-blob replay cost (~9 µs × 1313 blobs = ~12 ms/token on
+# Gemma 4) doesn't hide behind compute the way direct kernel launches do.
+# Bench numbers below were captured at HIPFIRE_GRAPH=1 on an older ROCm
+# stack when capture WAS a win — kept as the committed floor for now.
+# Either re-capture at HIPFIRE_GRAPH=0 in a follow-up or investigate the
+# ROCm 7.x hipGraph executor regression. See
+# docs/investigations/2026-05-19-gemma4-128k-branch-evidence-debt.md.
 # Tolerance: 0.05 (fail if any metric drops below baseline x (1 - tolerance))
 #
 # Measurements: best-of-2 via bench_qwen35_mq4. Two prefill sizes per model:
