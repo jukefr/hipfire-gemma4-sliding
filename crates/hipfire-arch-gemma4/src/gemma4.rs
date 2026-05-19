@@ -858,14 +858,6 @@ pub struct Gemma4Scratch {
     // Sliding uses head_dim=256, max_tiles=sliding_window/128 (much smaller).
     pub flash_partials: GpuTensor,
 
-    // Pre-computed RoPE cos/sin tables per layer type.
-    // Sliding: default RoPE, head_dim=256, theta=10000, n_rot = head_dim.
-    pub sliding_cos: GpuTensor, // [max_seq, head_dim]
-    pub sliding_sin: GpuTensor,
-    // Full: proportional RoPE, head_dim=512, theta=1e6, rotated_dims = 64 of 256-half
-    pub full_cos: GpuTensor,
-    pub full_sin: GpuTensor,
-
     // No-scale v_norm ones buffer (full-attn layers compute v_norm without
     // a learned weight — we pass this ones-filled tensor to the existing
     // rmsnorm kernel to get no-scale RMS semantics).
@@ -1003,12 +995,14 @@ impl Gemma4Scratch {
         let flash_partials_sz = config.n_heads * max_tiles_full * (2 + config.full_head_dim);
         let flash_partials = gpu.zeros(&[flash_partials_sz], DType::F32)?;
 
-        // RoPE tables. Same max_kv_seq cap so a single env override scales
-        // partials + tables together. The loader populates these per-model.
-        let sliding_cos = gpu.zeros(&[max_kv_seq * config.sliding_head_dim], DType::F32)?;
-        let sliding_sin = gpu.zeros(&[max_kv_seq * config.sliding_head_dim], DType::F32)?;
-        let full_cos = gpu.zeros(&[max_kv_seq * config.full_head_dim], DType::F32)?;
-        let full_sin = gpu.zeros(&[max_kv_seq * config.full_head_dim], DType::F32)?;
+        // (Note 2026-05-19): removed the precomputed sliding/full cos+sin
+        // tables that were allocated here but never read by any kernel.
+        // `rope_f32` and `rope_partial_halved_f32` compute cos/sin inline
+        // from `pos_buf[0]` + `freq_base`; the lookup-table path was wired
+        // but never finished. The tables ate 4 * max_kv_seq * head_dim
+        // floats — 768 MB at max_kv_seq=131072 — which pushed the full KV
+        // cache (~970 MB at 128k) out of VRAM into GTT (PCIe-paged system
+        // RAM), causing attention reads to take a slow path.
 
         // v_norm ones — populated on first use in the forward pass.
         // Allocated up to the LARGER of sliding_head_dim and full_head_dim
@@ -1082,7 +1076,6 @@ impl Gemma4Scratch {
             gate_ffn, up_ffn, ffn_hidden, ffn_out,
             logits, sample_buf, repeat_buf,
             flash_partials,
-            sliding_cos, sliding_sin, full_cos, full_sin,
             v_norm_ones_full,
             moe_cur_mlp, moe_pre2, moe_router_in, moe_router_logits,
             moe_topk_indices, moe_topk_weights, moe_cur_moe,
@@ -1123,10 +1116,6 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.sample_buf);
         let _ = gpu.free_tensor(self.repeat_buf);
         let _ = gpu.free_tensor(self.flash_partials);
-        let _ = gpu.free_tensor(self.sliding_cos);
-        let _ = gpu.free_tensor(self.sliding_sin);
-        let _ = gpu.free_tensor(self.full_cos);
-        let _ = gpu.free_tensor(self.full_sin);
         let _ = gpu.free_tensor(self.v_norm_ones_full);
         let _ = gpu.free_tensor(self.moe_cur_mlp);
         let _ = gpu.free_tensor(self.moe_pre2);
