@@ -1585,31 +1585,23 @@ pub fn forward_scratch(
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
 
     // hipGraph capture/replay policy.
-    //   - DEFAULT-OFF for Gemma 4.
-    //   - Root cause (Phase C bisect, 2026-05-19): the captured graph emits
-    //     saturated-softcap logits (top-5 all at ±29.99…) on every replay
-    //     because `kv_len = pos + 1` is passed as a SCALAR kernel argument
-    //     to every attention_flash_*_window dispatch site (sliding +
-    //     full layers, see calls below — `pos + 1` is the literal arg).
-    //     hipGraph bakes scalar args at capture time, so on every replay
-    //     the captured attention kernels read only K/V slots [0, captured_pos],
-    //     missing every freshly-written KV slot from kv_cache_write at the
-    //     new pos. The attention output is computed against an INCOMPLETE
-    //     KV history → drift → residual blow-up → softcap saturation.
-    //     `pos_buf` (the device int32) IS read correctly by rope_f32,
-    //     kv_cache_write*, and the attention kernels' RoPE-phase path —
-    //     those propagate the new pos. The bug is specifically the
-    //     `kv_len` upper-bound scalar.
-    //   - Fix path (NOT YET LANDED — keeps graph off-by-default):
-    //     thread kv_len through pos_buf as a derived `kv_len_buf` device
-    //     value, written via stream_write_value32 right before the captured
-    //     attention dispatch, and read by the kernel as a scalar load.
-    //     Touches every attention_flash_*_window kernel signature (~7
-    //     kernels) and the Rust dispatch helpers. Out of scope for this
-    //     session; recorded for the next graph-capture push.
-    //   - HIPFIRE_GRAPH=1 to opt in for debugging (still broken, but the
-    //     env knob is wired so the next bisect can use it).
-    //   - Compact offset != 0 (TriAttention eviction) also breaks capture
+    //   - DEFAULT-OFF for Gemma 4 (until cross-arch / long-context validation).
+    //   - Fixed 2026-05-19 (evening): the earlier diagnosis ("kv_len = pos + 1
+    //     is a scalar arg baked at capture") was wrong — attention_flash_*_window
+    //     kernels actually compute seq_len = pos_buf[0] + 1 at runtime
+    //     (`attention_flash_asym3_tile.hip:47`). The real bugs were three
+    //     elementwise kernels (`scale_f32`, `mul_f32`, `add_f32` in
+    //     `crates/rdna-compute/src/dispatch.rs`) that used direct `launch_kernel`
+    //     instead of `launch_maybe_blob`. `mul_f32` and `add_f32` additionally
+    //     ran on the default stream (`None`) instead of `stream_ref()`, so
+    //     during graph capture they were NOT recorded at all — every replay
+    //     skipped the FFN's `ffn_hidden = gelu(gate) * up` multiply, feeding
+    //     wrong tensors into down_proj → token attractor on greedy decode.
+    //     `scale_f32` was on the capture stream but using raw `kernelParams`
+    //     (stack pointers that dangle by replay under ROCm 7.x loader).
+    //     All three converted to `launch_maybe_blob` in the same commit as
+    //     this comment. HIPFIRE_GRAPH=1 now produces clean output.
+    //   - Compact offset != 0 (TriAttention eviction) still breaks capture
     //     for the same reason as Qwen35 — bail to direct in that case.
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {

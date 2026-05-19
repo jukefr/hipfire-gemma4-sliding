@@ -2475,6 +2475,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // mb4 path selector — same gate as MQ4-Lloyd's mb4 family.
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -2601,6 +2602,7 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -2768,6 +2770,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -2922,6 +2925,7 @@ impl Gpu {
         gate_m: usize, up_m: usize,
         k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = gate_m + up_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -3295,6 +3299,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(k % 256 == 0, "gemv_hfp4g32 requires K%256==0 in v1, got K={}", k);
         self.bind_thread()?;
         // Shape-gated: FP8 dot4 only when M is large enough that it
@@ -3360,6 +3365,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(k % 256 == 0, "gemv_hfp4g32_fp8 requires K%256==0, got K={}", k);
         self.bind_thread()?;
         self.ensure_kernel(
@@ -4225,6 +4231,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(k % 256 == 0, "gemv_hfp4g32_dot2 requires K%256==0, got K={}", k);
         self.bind_thread()?;
         self.ensure_kernel(
@@ -4785,6 +4792,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -4843,6 +4851,7 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -4909,6 +4918,7 @@ impl Gpu {
         gate_m: usize, up_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -6709,6 +6719,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // HFQ3 mb4 path selector. Only triggers on gfx11; gfx12 keeps its
         // existing fast path (line below) since mb4 sibling not ported.
         let total_m = qkv_m + z_m + beta_m + alpha_m;
@@ -7165,6 +7176,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -8102,6 +8114,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = gate_m + up_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -9424,6 +9437,7 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize, k_top: usize, n_exp: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.gemv_hfq4g256_moe_gate_up_bucketed(
             expert_ptrs, expert_offsets, expert_token_list,
             x_rot, y_gate, y_up, m, k, k_top, n_exp,
@@ -9503,6 +9517,7 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Reuse the HFQ4G256 indexed kernel — same memory layout, same
         // inner loop. Caller already did the FWHT pre-rotation.
         self.gemv_hfq4g256_moe_gate_up_k8_indexed(
@@ -10670,6 +10685,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
         let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
@@ -11144,6 +11160,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_hfq4g256_residual_wave64_dp4a",
             kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_DP4A_SRC,
@@ -11233,6 +11250,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq4g256_wave64_dp4a",
             kernels::GEMM_QKVZA_HFQ4G256_WAVE64_DP4A_SRC,
@@ -11341,6 +11359,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq4g256_wave64_dp4a",
             kernels::GEMM_QKV_HFQ4G256_WAVE64_DP4A_SRC,
@@ -11437,6 +11456,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq4g256_wave64_dp4a",
             kernels::GEMM_GATE_UP_HFQ4G256_WAVE64_DP4A_SRC,
@@ -11734,6 +11754,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -12150,6 +12171,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -12617,6 +12639,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -13042,6 +13065,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -13505,6 +13529,7 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         const MAX_BATCH: usize = 64;
         let mut off = 0;
         while off < n {
@@ -13528,6 +13553,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if self.arch.starts_with("gfx12") {
             return self.gemm_qkvza_q8_0_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha,
@@ -13620,6 +13646,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if self.arch.starts_with("gfx12") {
             return self.gemm_gate_up_q8_0_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -13696,6 +13723,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if self.arch.starts_with("gfx12") {
             return self.gemm_q8_0_residual_wmma_gfx12(a, x, y, m, k, batch_size);
         }
@@ -13760,6 +13788,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if self.arch.starts_with("gfx12") {
             return self.gemm_qkv_q8_0_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
@@ -13846,6 +13875,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         debug_assert_eq!(k % 32, 0, "gemm_qkv_q8_0_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
@@ -13922,6 +13952,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         debug_assert_eq!(k % 32, 0, "gemm_qkvza_q8_0_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
@@ -14003,6 +14034,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         debug_assert_eq!(k % 32, 0, "gemm_gate_up_q8_0_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
@@ -14073,6 +14105,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
         self.ensure_kernel(
@@ -14572,24 +14605,32 @@ impl Gpu {
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
-        let func = &self.functions["add_f32"];
 
         let n = a.numel() as i32;
-        let mut a_ptr = a.buf.as_ptr();
-        let mut b_ptr = b.buf.as_ptr();
-        let mut c_ptr = c.buf.as_ptr();
-        let mut n_val = n;
+        let a_ptr = a.buf.as_ptr();
+        let b_ptr = b.buf.as_ptr();
+        let c_ptr = c.buf.as_ptr();
+        let n_val = n;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut c_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &b_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
         ];
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
+        // 2026-05-19: blob path for hipGraph capture safety (mul_f32/scale_f32 sibling fix).
+        self.launch_maybe_blob(
+            "add_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(a_ptr); bb.push_ptr(b_ptr); bb.push_ptr(c_ptr); bb.push_i32(n_val);
+                bb
+            },
+        )
     }
 
     /// a += b (in-place element-wise add)
@@ -14626,29 +14667,44 @@ impl Gpu {
     }
 
     /// c = a * b (element-wise)
+    ///
+    /// 2026-05-19: converted to `launch_maybe_blob` (stream_ref + blob kernargs)
+    /// so the kernel is captured into hipGraph and replays correctly. The prior
+    /// `launch_kernel(..., None, ...)` ran on the default stream, so during
+    /// graph capture this kernel was NOT recorded — every replay missed the
+    /// FFN's `ffn_hidden = gelu(gate) * up` multiply, feeding wrong tensors
+    /// into down_proj. That manifested as the Gemma 4 HIPFIRE_GRAPH=1
+    /// token-attractor (`<|channel> own로 ownな ownな…`).
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("mul", kernels::MUL_SRC, "mul_f32")?;
-        let func = &self.functions["mul_f32"];
 
         let n = a.numel() as i32;
-        let mut a_ptr = a.buf.as_ptr();
-        let mut b_ptr = b.buf.as_ptr();
-        let mut c_ptr = c.buf.as_ptr();
-        let mut n_val = n;
+        let a_ptr = a.buf.as_ptr();
+        let b_ptr = b.buf.as_ptr();
+        let c_ptr = c.buf.as_ptr();
+        let n_val = n;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut c_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &b_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
         ];
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise_bytes(n as usize);
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "mul_f32", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) };
+        let result = self.launch_maybe_blob(
+            "mul_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(a_ptr); bb.push_ptr(b_ptr); bb.push_ptr(c_ptr); bb.push_i32(n_val);
+                bb
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -15590,6 +15646,7 @@ impl Gpu {
         n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.attention_flash_q8_0_window(
             q, k_cache, v_cache, out, pos_buf, seq_len_hint,
             n_heads, n_kv_heads, head_dim, max_seq, partials, 0,
@@ -16637,6 +16694,7 @@ impl Gpu {
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.attention_flash_asym3_window(
             q, k_cache, v_cache, out, pos_buf, cos_theta, sin_theta,
             seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0, 0,
@@ -16659,6 +16717,7 @@ impl Gpu {
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor, window_size: u32, cache_capacity: u32,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if head_dim == 512 && cache_capacity > 0 {
             return Err(hip_bridge::HipError::new(0, &format!(
                 "attention_flash_asym3_window: cache_capacity={} not supported on \
@@ -16920,6 +16979,7 @@ impl Gpu {
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.attention_flash_asym4_window(
             q, k_cache, v_cache, out, pos_buf, cos_theta, sin_theta,
             seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0,
@@ -17235,6 +17295,7 @@ impl Gpu {
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.attention_flash_asym2_window(
             q, k_cache, v_cache, out, pos_buf, cos_theta, sin_theta,
             seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0,
@@ -19346,24 +19407,38 @@ impl Gpu {
     }
 
     /// Scale vector by constant: x[i] *= scale. Replaces 48µs CPU roundtrip.
+    ///
+    /// 2026-05-19: converted to `launch_maybe_blob` so the kernel survives
+    /// hipGraph capture cleanly. The prior path (stream_ref + raw kernarg
+    /// pointers) recorded stack pointers into the captured graph; under
+    /// ROCm 7.x loader the dangling pointers caused silent corruption at
+    /// replay time. Sibling fix to mul_f32 / add_f32.
     #[cfg(feature = "deltanet")]
     pub fn scale_f32(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;
-        let func = &self.functions["scale_f32"];
         let n = x.numel();
-        let mut xp = x.buf.as_ptr();
-        let mut nv = n as i32;
-        let mut sv = scale;
+        let xp = x.buf.as_ptr();
+        let nv = n as i32;
+        let sv = scale;
         let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void, &mut nv as *mut _ as *mut c_void,
-            &mut sv as *mut _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &sv as *const _ as *mut c_void,
         ];
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise1_bytes(n);
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "scale_f32", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        let result = self.launch_maybe_blob(
+            "scale_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(xp); bb.push_i32(nv); bb.push_f32(sv);
+                bb
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
