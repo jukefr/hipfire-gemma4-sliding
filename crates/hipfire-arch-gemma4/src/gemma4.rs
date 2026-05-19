@@ -912,6 +912,22 @@ pub struct Gemma4Scratch {
     pub pb_moe_cur_mlp: GpuTensor,
     /// `[N × dim]` — residual stream per token across the prefill batch.
     pub pb_residual: GpuTensor,
+    /// `[N × dim]` — post-rmsnorm input for batched projections.
+    pub pb_tmp: GpuTensor,
+    /// `[N × max_q_dim]` — batched Q projection output (sized for full layer = n_heads * full_head_dim).
+    pub pb_q: GpuTensor,
+    /// `[N × max_kv_dim]` — batched K projection output.
+    pub pb_k: GpuTensor,
+    /// `[N × max_kv_dim]` — batched V projection output.
+    pub pb_v: GpuTensor,
+    /// `[N × hidden_dim]` — batched gate proj output.
+    pub pb_gate: GpuTensor,
+    /// `[N × hidden_dim]` — batched up proj output.
+    pub pb_up: GpuTensor,
+    /// `[N × hidden_dim]` — batched gelu(gate)*up.
+    pub pb_ffn_hidden: GpuTensor,
+    /// `[N]` — i32 position buffer for batched RoPE.
+    pub pb_positions: GpuTensor,
     /// `[k_top × mi]` — gelu_tanh(gate)*up batched over k_top experts.
     pub moe_expert_hidden_batch: GpuTensor,
 }
@@ -1017,6 +1033,19 @@ impl Gemma4Scratch {
         let pb_moe_cur_moe       = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
         let pb_moe_cur_mlp       = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
         let pb_residual          = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_tmp               = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        // Sized for max across sliding/full per-token vector dims.
+        // q_dim_max = n_heads * max(sliding_head_dim, full_head_dim)
+        let q_dim_max = config.n_heads * config.sliding_head_dim.max(config.full_head_dim);
+        let kv_dim_max = (config.sliding_n_kv_heads * config.sliding_head_dim)
+            .max(config.full_n_kv_heads * config.full_head_dim);
+        let pb_q = gpu.zeros(&[MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
+        let pb_k = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
+        let pb_v = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
+        let pb_gate = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
+        let pb_up = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
+        let pb_ffn_hidden = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
+        let pb_positions = gpu.zeros(&[MAX_PREFILL_BATCH], DType::F32)?; // i32 packed in f32 slots
 
         Ok(Gemma4Scratch {
             x, residual, tmp, pos_buf,
@@ -1039,6 +1068,8 @@ impl Gemma4Scratch {
             pb_moe_topk_indices, pb_moe_topk_weights,
             pb_moe_gate_batch, pb_moe_up_batch, pb_moe_hidden_batch,
             pb_moe_cur_moe, pb_moe_cur_mlp, pb_residual,
+            pb_tmp, pb_q, pb_k, pb_v, pb_gate, pb_up, pb_ffn_hidden,
+            pb_positions,
         })
     }
 
@@ -1095,6 +1126,14 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.pb_moe_cur_moe);
         let _ = gpu.free_tensor(self.pb_moe_cur_mlp);
         let _ = gpu.free_tensor(self.pb_residual);
+        let _ = gpu.free_tensor(self.pb_tmp);
+        let _ = gpu.free_tensor(self.pb_q);
+        let _ = gpu.free_tensor(self.pb_k);
+        let _ = gpu.free_tensor(self.pb_v);
+        let _ = gpu.free_tensor(self.pb_gate);
+        let _ = gpu.free_tensor(self.pb_up);
+        let _ = gpu.free_tensor(self.pb_ffn_hidden);
+        let _ = gpu.free_tensor(self.pb_positions);
     }
 }
 
@@ -2050,6 +2089,20 @@ pub fn forward_prefill_batch(
     kv_full: &mut hipfire_runtime::llama::KvCache,
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
+    forward_prefill_batch_v2(gpu, weights, config, tokens, start_pos, kv_sliding, kv_full, scratch)
+}
+
+#[allow(dead_code)]
+fn forward_prefill_batch_v1_old(
+    gpu: &mut Gpu,
+    weights: &Gemma4Weights,
+    config: &Gemma4Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_sliding: &mut hipfire_runtime::llama::KvCache,
+    kv_full: &mut hipfire_runtime::llama::KvCache,
+    scratch: &Gemma4Scratch,
+) -> HipResult<()> {
     let n_batch = tokens.len();
     if n_batch == 0 { return Ok(()); }
     if n_batch > scratch.max_prefill_batch {
@@ -2185,6 +2238,253 @@ pub fn forward_prefill_batch(
                             &scratch.x.buf, 0, dim_bytes, s)?;
                     }
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// V2 batched prefill — batches both the dense projections AND the MoE
+/// branch across N tokens. Per-token RoPE and attention stay sequential
+/// because the flash kernels haven't been ported to prefill-batched layout.
+fn forward_prefill_batch_v2(
+    gpu: &mut Gpu,
+    weights: &Gemma4Weights,
+    config: &Gemma4Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_sliding: &mut hipfire_runtime::llama::KvCache,
+    kv_full: &mut hipfire_runtime::llama::KvCache,
+    scratch: &Gemma4Scratch,
+) -> HipResult<()> {
+    let n_batch = tokens.len();
+    if n_batch == 0 { return Ok(()); }
+    if n_batch > scratch.max_prefill_batch {
+        return Err(hip_bridge::HipError::new(0, &format!(
+            "forward_prefill_batch: n_batch={n_batch} > max_prefill_batch={}",
+            scratch.max_prefill_batch)));
+    }
+    let dim = config.dim;
+    let dim_bytes = dim * 4;
+
+    // Upload positions array [start_pos, start_pos+1, ..., start_pos+N-1] for batched RoPE.
+    let pos_array: Vec<i32> = (0..n_batch).map(|i| (start_pos + i) as i32).collect();
+    let pos_bytes: Vec<u8> = pos_array.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    gpu.hip.memcpy_htod(&scratch.pb_positions.buf, &pos_bytes)?;
+
+    // Step 1: per-token embed lookup into pb_residual.
+    for (i, &tok) in tokens.iter().enumerate() {
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.embed_tokens, &scratch.x, tok, dim)?,
+            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.embed_tokens, &scratch.x, tok, dim)?,
+            EmbeddingFormat::Q8_0    => gpu.embedding_lookup_q8(&weights.embed_tokens, &scratch.x, tok, dim)?,
+            EmbeddingFormat::F32     => gpu.embedding_lookup(&weights.embed_tokens, &scratch.x, tok, dim)?,
+            _ => return Err(hip_bridge::HipError::new(0, "unsupported Gemma 4 embed format")),
+        }
+        gpu.scale_f32(&scratch.x, config.embed_scale)?;
+        gpu.hip.memcpy_dtod_at(&scratch.pb_residual.buf, i * dim_bytes,
+            &scratch.x.buf, 0, dim_bytes)?;
+    }
+
+    // Step 2: layer loop.
+    let mut sliding_kv_idx = 0usize;
+    let mut full_kv_idx = 0usize;
+    for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
+        let (layer_scalar, post_ffn_norm_ref, moe_opt) =
+            match (layer_type, &weights.layers[layer_idx]) {
+                (LayerType::Sliding, LayerWeights::Sliding(lw)) =>
+                    (lw.layer_scalar_host, &lw.post_feedforward_layernorm, lw.moe.as_ref()),
+                (LayerType::Full, LayerWeights::Full(lw)) =>
+                    (lw.layer_scalar_host, &lw.post_feedforward_layernorm, lw.moe.as_ref()),
+                _ => return Err(hip_bridge::HipError::new(0,
+                    &format!("layer {layer_idx} type/weights mismatch"))),
+            };
+
+        // ── 2A: batched pre-attn rmsnorm + Q/K/V projections + Q/K/V norms + RoPE. ──
+        match (layer_type, &weights.layers[layer_idx]) {
+            (LayerType::Sliding, LayerWeights::Sliding(lw)) => {
+                let head_dim = config.sliding_head_dim;
+                let n_heads = config.n_heads;
+                let n_kv = config.sliding_n_kv_heads;
+                let q_dim = n_heads * head_dim;
+                let kv_dim = n_kv * head_dim;
+                let kv_dim_bytes = kv_dim * 4;
+                let q_dim_bytes = q_dim * 4;
+
+                gpu.rmsnorm_batched(&scratch.pb_residual, &lw.input_layernorm,
+                    &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
+                weight_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch)?;
+                weight_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch)?;
+                weight_gemm(gpu, &lw.v_proj, &scratch.pb_tmp, &scratch.pb_v, n_batch)?;
+                gpu.rmsnorm_batched(&scratch.pb_q, &lw.q_norm, &scratch.pb_q,
+                    n_batch * n_heads, head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(&scratch.pb_k, &lw.k_norm, &scratch.pb_k,
+                    n_batch * n_kv, head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(&scratch.pb_v, &scratch.v_norm_ones_full, &scratch.pb_v,
+                    n_batch * n_kv, head_dim, config.norm_eps)?;
+                gpu.scale_f32(&scratch.pb_q, (head_dim as f32).sqrt())?;
+                gpu.rope_batched_f32(&scratch.pb_q, &scratch.pb_k, &scratch.pb_positions,
+                    n_heads, n_kv, head_dim, config.sliding_rope_theta, n_batch)?;
+
+                for i in 0..n_batch {
+                    let pos = start_pos + i;
+                    let pos_i32 = pos as i32;
+                    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+                    gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0,
+                        &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                    gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0,
+                        &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0,
+                        &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    let ct = kv_sliding.givens_cos.as_ref().unwrap();
+                    let st = kv_sliding.givens_sin.as_ref().unwrap();
+                    let sliding_cap = config.sliding_window as u32;
+                    gpu.kv_cache_write_asym3_fused(
+                        &kv_sliding.k_gpu[sliding_kv_idx], &kv_sliding.v_gpu[sliding_kv_idx],
+                        &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim,
+                        sliding_cap)?;
+                    gpu.attention_flash_asym3_window(
+                        &scratch.q, &kv_sliding.k_gpu[sliding_kv_idx], &kv_sliding.v_gpu[sliding_kv_idx],
+                        &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+                        n_heads, n_kv, head_dim, kv_sliding.max_seq,
+                        &scratch.flash_partials,
+                        sliding_cap, sliding_cap,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes,
+                        &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                }
+                sliding_kv_idx += 1;
+
+                weight_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
+                gpu.rmsnorm_batched(&scratch.pb_attn_out, &lw.post_attention_layernorm,
+                    &scratch.pb_attn_out, n_batch, dim, config.norm_eps)?;
+                gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_attn_out)?;
+            }
+            (LayerType::Full, LayerWeights::Full(lw)) => {
+                let head_dim = config.full_head_dim;
+                let n_heads = config.n_heads;
+                let n_kv = config.full_n_kv_heads;
+                let q_dim = n_heads * head_dim;
+                let kv_dim = n_kv * head_dim;
+                let kv_dim_bytes = kv_dim * 4;
+                let q_dim_bytes = q_dim * 4;
+
+                gpu.rmsnorm_batched(&scratch.pb_residual, &lw.input_layernorm,
+                    &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
+                weight_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch)?;
+                weight_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch)?;
+                if let Some(s) = gpu.active_stream.as_ref() {
+                    gpu.hip.memcpy_dtod_async_at(&scratch.pb_v.buf, 0,
+                        &scratch.pb_k.buf, 0, n_batch * kv_dim_bytes, s)?;
+                } else {
+                    gpu.hip.memcpy_dtod_at(&scratch.pb_v.buf, 0,
+                        &scratch.pb_k.buf, 0, n_batch * kv_dim_bytes)?;
+                }
+                gpu.rmsnorm_batched(&scratch.pb_q, &lw.q_norm, &scratch.pb_q,
+                    n_batch * n_heads, head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(&scratch.pb_k, &lw.k_norm, &scratch.pb_k,
+                    n_batch * n_kv, head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(&scratch.pb_v, &scratch.v_norm_ones_full, &scratch.pb_v,
+                    n_batch * n_kv, head_dim, config.norm_eps)?;
+                gpu.scale_f32(&scratch.pb_q, (head_dim as f32).sqrt())?;
+                let n_rot_pairs = ((head_dim as f32) * config.full_partial_rotary_factor * 0.5) as usize;
+                // Per-token partial-halved RoPE (no batched variant yet for this shape).
+                for i in 0..n_batch {
+                    let pos = start_pos + i;
+                    let pos_i32 = pos as i32;
+                    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+                    gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0,
+                        &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                    gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0,
+                        &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    gpu.rope_partial_halved_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
+                        n_heads, n_kv, head_dim, n_rot_pairs, config.full_rope_theta)?;
+                    gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes,
+                        &scratch.q.buf, 0, q_dim_bytes)?;
+                    gpu.hip.memcpy_dtod_at(&scratch.pb_k.buf, i * kv_dim_bytes,
+                        &scratch.k.buf, 0, kv_dim_bytes)?;
+                }
+
+                for i in 0..n_batch {
+                    let pos = start_pos + i;
+                    let pos_i32 = pos as i32;
+                    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+                    gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0,
+                        &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                    gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0,
+                        &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0,
+                        &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    let ct = kv_full.givens_cos.as_ref().unwrap();
+                    let st = kv_full.givens_sin.as_ref().unwrap();
+                    gpu.kv_cache_write_asym3_fused(
+                        &kv_full.k_gpu[full_kv_idx], &kv_full.v_gpu[full_kv_idx],
+                        &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim, 0)?;
+                    gpu.attention_flash_asym3_window(
+                        &scratch.q, &kv_full.k_gpu[full_kv_idx], &kv_full.v_gpu[full_kv_idx],
+                        &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+                        n_heads, n_kv, head_dim, kv_full.max_seq,
+                        &scratch.flash_partials, 0, 0,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes,
+                        &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                }
+                full_kv_idx += 1;
+
+                weight_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
+                gpu.rmsnorm_batched(&scratch.pb_attn_out, &lw.post_attention_layernorm,
+                    &scratch.pb_attn_out, n_batch, dim, config.norm_eps)?;
+                gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_attn_out)?;
+            }
+            _ => unreachable!(),
+        }
+
+        // Snapshot post-attn residual for MoE input.
+        if let Some(s) = gpu.active_stream.as_ref() {
+            gpu.hip.memcpy_dtod_async_at(&scratch.pb_attn_out.buf, 0,
+                &scratch.pb_residual.buf, 0, n_batch * dim_bytes, s)?;
+        } else {
+            gpu.hip.memcpy_dtod_at(&scratch.pb_attn_out.buf, 0,
+                &scratch.pb_residual.buf, 0, n_batch * dim_bytes)?;
+        }
+
+        // Batched pre-FFN rmsnorm + dense FFN.
+        match (layer_type, &weights.layers[layer_idx]) {
+            (LayerType::Sliding, LayerWeights::Sliding(lw)) => {
+                gpu.rmsnorm_batched(&scratch.pb_residual, &lw.pre_feedforward_layernorm,
+                    &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
+                weight_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch)?;
+                weight_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch)?;
+                gpu.gelu_tanh_f32(&scratch.pb_gate, &scratch.pb_ffn_hidden,
+                    n_batch * config.hidden_dim)?;
+                gpu.mul_f32(&scratch.pb_ffn_hidden, &scratch.pb_up, &scratch.pb_ffn_hidden)?;
+                weight_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch)?;
+            }
+            (LayerType::Full, LayerWeights::Full(lw)) => {
+                gpu.rmsnorm_batched(&scratch.pb_residual, &lw.pre_feedforward_layernorm,
+                    &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
+                weight_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch)?;
+                weight_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch)?;
+                gpu.gelu_tanh_f32(&scratch.pb_gate, &scratch.pb_ffn_hidden,
+                    n_batch * config.hidden_dim)?;
+                gpu.mul_f32(&scratch.pb_ffn_hidden, &scratch.pb_up, &scratch.pb_ffn_hidden)?;
+                weight_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch)?;
+            }
+            _ => unreachable!(),
+        }
+
+        // MoE branch (or dense fallback).
+        match moe_opt {
+            Some(moe) => {
+                apply_moe_branch_batched(gpu, config, scratch, moe, post_ffn_norm_ref, n_batch)?;
+                gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_moe_pre2)?;
+                gpu.scale_f32(&scratch.pb_residual, layer_scalar)?;
+            }
+            None => {
+                gpu.rmsnorm_batched(&scratch.pb_ffn_out, post_ffn_norm_ref,
+                    &scratch.pb_ffn_out, n_batch, dim, config.norm_eps)?;
+                gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_ffn_out)?;
+                gpu.scale_f32(&scratch.pb_residual, layer_scalar)?;
             }
         }
     }

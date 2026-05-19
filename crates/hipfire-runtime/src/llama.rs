@@ -1168,6 +1168,21 @@ pub fn weight_gemm(
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
+        DType::MQ4G256 => {
+            // MQ4G256 is binary-identical to HFQ4G256 (136 B groups, same
+            // codebook layout); the only difference is the input must be
+            // FWHT-rotated before the GEMM. The runtime applies one
+            // rotate-x pass over the [N × K] input then calls the existing
+            // HFQ4G256 batched GEMM. Saves N separate GEMV launches —
+            // for Gemma 4 26B-A4B, dense Q/K/V/O/gate/up projections
+            // (~24 MQ4G256 GEMMs per layer per batch) drop from N kernel
+            // launches each to 1.
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            gpu.rotate_x_mq_batched(x, &x_rot, w.k, batch_size)?;
+            let r = gpu.gemm_hfq4g256(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
         _ => {
             // Fallback: repeated GEMV (no batched kernel for this format)
             let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
