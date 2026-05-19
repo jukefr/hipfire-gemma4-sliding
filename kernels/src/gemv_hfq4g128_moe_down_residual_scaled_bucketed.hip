@@ -1,24 +1,25 @@
 #include <hip/hip_runtime.h>
 
-// Routing-bucketed MoE down + scaled residual (HFQ4G128). Each block processes
-// ONE output row for ONE expert across ALL tokens routed to that expert,
-// holding the weight tile in registers for reuse across the bucket.
+// Routing-bucketed MoE down + scaled residual (HFQ4G128), LDS-staged.
 //
-// Mirrors `gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched` but
-// dispatched bucketed: grid (M, n_exp) instead of (M, K_TOP, N).
+// Sister to the LDS-staged gate_up bucketed kernel. Each block stages the
+// down-weight row into LDS once at the start, then iterates over all
+// tokens routed to the expert, atomicAdd-ing into x_residual for each.
 //
 // Shapes:
 //   expert_ptrs       : [n_exp]
 //   expert_offsets    : [n_exp + 1]
-//   expert_token_list : [N × K_TOP] packed (token_idx * K_TOP + krank), sorted by expert
+//   expert_token_list : [N × K_TOP]    token_idx * K_TOP + krank, sorted by expert
 //   topk_weights      : [N × K_TOP]
 //   per_expert_scale  : [n_exp]
 //   hidden_batch      : [N × K_TOP × K]
-//   x_residual        : [N × M]    atomicAdd into existing residual
+//   x_residual        : [N × M]        atomicAdd into existing residual
 //
-// Grid: (M, n_exp). Block = 32 threads.
+// Grid: (M, n_exp). Block: 32 threads.
+// LDS budget per block: ceil(K/128) * 72 bytes (432 B for Gemma 4 K=704).
+// Bounded by MAX_LDS_DOWN_BYTES = 1152 B (K up to 2048).
 
-#define MAX_DOWN_GROUPS 16
+#define MAX_LDS_DOWN_BYTES 1152
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_hfq4g128_moe_down_residual_scaled_bucketed(
@@ -45,32 +46,16 @@ extern "C" __global__ void gemv_hfq4g128_moe_down_residual_scaled_bucketed(
     const int groups_per_row = (K + 127) / 128;
     const char* row_ptr = A + (long long)row * groups_per_row * 72;
 
-    // Load weight tile for this (row, expert) once.
-    float sc_arr[MAX_DOWN_GROUPS];
-    float zp_arr[MAX_DOWN_GROUPS];
-    unsigned char nb0_arr[MAX_DOWN_GROUPS];
-    unsigned char nb1_arr[MAX_DOWN_GROUPS];
-    int valid_arr[MAX_DOWN_GROUPS];  // how many of {v0,v1,v2,v3} live (0..4)
-
-    #pragma unroll
-    for (int g = 0; g < MAX_DOWN_GROUPS; g++) {
-        if (g < groups_per_row) {
-            const char* gptr = row_ptr + g * 72;
-            sc_arr[g] = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
-            zp_arr[g] = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
-            const unsigned char* nibbles = (const unsigned char*)(gptr + 8);
-            const int byte_off = tid * 2;
-            nb0_arr[g] = nibbles[byte_off];
-            nb1_arr[g] = nibbles[byte_off + 1];
-            const int base_idx = g * 128 + tid * 4;
-            int v = 0;
-            if (base_idx + 0 < K) v++;
-            if (base_idx + 1 < K) v++;
-            if (base_idx + 2 < K) v++;
-            if (base_idx + 3 < K) v++;
-            valid_arr[g] = v;
-        }
+    // Stage row into LDS (cooperative 32-thread load).
+    __shared__ unsigned char lds_weights[MAX_LDS_DOWN_BYTES];
+    const int row_bytes = groups_per_row * 72;
+    const int n_words = row_bytes >> 2;
+    unsigned int* lds_w32 = reinterpret_cast<unsigned int*>(lds_weights);
+    const unsigned int* row_w32 = reinterpret_cast<const unsigned int*>(row_ptr);
+    for (int w = tid; w < n_words; w += 32) {
+        lds_w32[w] = row_w32[w];
     }
+    __syncthreads();
 
     const float pes = per_expert_scale[expert_id];
 
@@ -82,23 +67,27 @@ extern "C" __global__ void gemv_hfq4g128_moe_down_residual_scaled_bucketed(
             hidden_batch + ((long long)token_idx * K_TOP + krank) * K;
 
         float acc = 0.0f;
-        #pragma unroll
-        for (int g = 0; g < MAX_DOWN_GROUPS; g++) {
-            if (g < groups_per_row) {
-                const int base_idx = g * 128 + tid * 4;
-                const float v0 = sc_arr[g] * (float)(nb0_arr[g] & 0xF) + zp_arr[g];
-                const float v1 = sc_arr[g] * (float)(nb0_arr[g] >> 4)  + zp_arr[g];
-                const float v2 = sc_arr[g] * (float)(nb1_arr[g] & 0xF) + zp_arr[g];
-                const float v3 = sc_arr[g] * (float)(nb1_arr[g] >> 4)  + zp_arr[g];
-                const int v = valid_arr[g];
-                if (v == 4) {
-                    acc += v0 * x[base_idx]     + v1 * x[base_idx + 1]
-                         + v2 * x[base_idx + 2] + v3 * x[base_idx + 3];
-                } else {
-                    if (v >= 1) acc += v0 * x[base_idx + 0];
-                    if (v >= 2) acc += v1 * x[base_idx + 1];
-                    if (v >= 3) acc += v2 * x[base_idx + 2];
-                }
+        for (int g = 0; g < groups_per_row; g++) {
+            const unsigned char* gp = lds_weights + g * 72;
+            float scale = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+            float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+            const unsigned char* nibbles = gp + 8;
+            const int byte_off = tid * 2;
+            const unsigned char b0 = nibbles[byte_off];
+            const unsigned char b1 = nibbles[byte_off + 1];
+            const float v0 = scale * (float)(b0 & 0xF) + zero;
+            const float v1 = scale * (float)(b0 >> 4)  + zero;
+            const float v2 = scale * (float)(b1 & 0xF) + zero;
+            const float v3 = scale * (float)(b1 >> 4)  + zero;
+
+            const int base_idx = g * 128 + tid * 4;
+            if (base_idx + 3 < K) {
+                acc += v0 * x[base_idx]     + v1 * x[base_idx + 1]
+                     + v2 * x[base_idx + 2] + v3 * x[base_idx + 3];
+            } else {
+                if (base_idx + 0 < K) acc += v0 * x[base_idx + 0];
+                if (base_idx + 1 < K) acc += v1 * x[base_idx + 1];
+                if (base_idx + 2 < K) acc += v2 * x[base_idx + 2];
             }
         }
 
