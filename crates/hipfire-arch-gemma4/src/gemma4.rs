@@ -2282,8 +2282,11 @@ fn forward_prefill_batch_v2(
             _ => return Err(hip_bridge::HipError::new(0, "unsupported Gemma 4 embed format")),
         }
         gpu.scale_f32(&scratch.x, config.embed_scale)?;
-        gpu.hip.memcpy_dtod_at(&scratch.pb_residual.buf, i * dim_bytes,
-            &scratch.x.buf, 0, dim_bytes)?;
+        if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_residual.buf, i * dim_bytes, &scratch.x.buf, 0, dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.pb_residual.buf, i * dim_bytes, &scratch.x.buf, 0, dim_bytes)?;
+                    }
     }
 
     // Step 2: layer loop.
@@ -2328,14 +2331,27 @@ fn forward_prefill_batch_v2(
 
                 for i in 0..n_batch {
                     let pos = start_pos + i;
-                    let pos_i32 = pos as i32;
-                    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-                    gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0,
-                        &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
-                    gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0,
-                        &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                    gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0,
-                        &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    if let Some(stream) = gpu.active_stream.as_ref() {
+                        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+                    } else {
+                        let pos_i32 = pos as i32;
+                        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    }
                     let ct = kv_sliding.givens_cos.as_ref().unwrap();
                     let st = kv_sliding.givens_sin.as_ref().unwrap();
                     let sliding_cap = config.sliding_window as u32;
@@ -2350,8 +2366,11 @@ fn forward_prefill_batch_v2(
                         &scratch.flash_partials,
                         sliding_cap, sliding_cap,
                     )?;
-                    gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes,
-                        &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                    }
                 }
                 sliding_kv_idx += 1;
 
@@ -2391,30 +2410,59 @@ fn forward_prefill_batch_v2(
                 // Per-token partial-halved RoPE (no batched variant yet for this shape).
                 for i in 0..n_batch {
                     let pos = start_pos + i;
-                    let pos_i32 = pos as i32;
-                    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-                    gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0,
-                        &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
-                    gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0,
-                        &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    if let Some(stream) = gpu.active_stream.as_ref() {
+                        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+                    } else {
+                        let pos_i32 = pos as i32;
+                        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    }
                     gpu.rope_partial_halved_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
                         n_heads, n_kv, head_dim, n_rot_pairs, config.full_rope_theta)?;
-                    gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes,
-                        &scratch.q.buf, 0, q_dim_bytes)?;
-                    gpu.hip.memcpy_dtod_at(&scratch.pb_k.buf, i * kv_dim_bytes,
-                        &scratch.k.buf, 0, kv_dim_bytes)?;
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.q.buf, 0, q_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.q.buf, 0, q_dim_bytes)?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_k.buf, i * kv_dim_bytes, &scratch.k.buf, 0, kv_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.pb_k.buf, i * kv_dim_bytes, &scratch.k.buf, 0, kv_dim_bytes)?;
+                    }
                 }
 
                 for i in 0..n_batch {
                     let pos = start_pos + i;
-                    let pos_i32 = pos as i32;
-                    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-                    gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0,
-                        &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
-                    gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0,
-                        &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                    gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0,
-                        &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    if let Some(stream) = gpu.active_stream.as_ref() {
+                        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+                    } else {
+                        let pos_i32 = pos as i32;
+                        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    }
                     let ct = kv_full.givens_cos.as_ref().unwrap();
                     let st = kv_full.givens_sin.as_ref().unwrap();
                     gpu.kv_cache_write_asym3_fused(
@@ -2426,8 +2474,11 @@ fn forward_prefill_batch_v2(
                         n_heads, n_kv, head_dim, kv_full.max_seq,
                         &scratch.flash_partials, 0, 0,
                     )?;
-                    gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes,
-                        &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                    }
                 }
                 full_kv_idx += 1;
 
