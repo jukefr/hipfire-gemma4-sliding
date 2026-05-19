@@ -45,3 +45,14 @@
 9b_3.5_dflash_merge_sort_tok_s=354.61
 9b_3.5_dflash_merge_sort_tau=13.1538
 9b_3.5_dflash_merge_sort_ttft_ms=70.84
+
+# Gemma 4 26B-A4B-it (MoE 128 experts / top-8, 30 layers = 25 sliding + 5 full,
+# asym3 KV both paths). Captured 2026-05-19 via bench_gemma4_mq4 (per-token
+# forward_scratch loop — not the batched daemon path). Numbers are
+# best-of-3 medians at prefill=32 and prefill=128, warmup=5, gen=50.
+# Conservative floor: the daemon's batched-prefill v1 routes ~109 tok/s prefill
+# vs the per-token 69 tok/s here; this baseline catches per-token kernel
+# regressions independent of batched-prefill changes.
+gemma4_26b_a4b_pp32_prefill_tok_s=69.15
+gemma4_26b_a4b_gen_tok_s=68.12
+gemma4_26b_a4b_pp128_prefill_tok_s=67.50

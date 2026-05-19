@@ -42,7 +42,7 @@
     "qwopus:4b-mq6":     { "repo": "schuttdev/hipfire-qwopus-4b",  "file": "qwopus-4b.mq6",  "size_gb": 3.8, "min_vram_gb": 5,  "desc": "Qwopus3.5 v3, 4B MQ6" },
     "qwopus:27b-mq6":    { "repo": "schuttdev/hipfire-qwopus-27b", "file": "qwopus-27b.mq6", "size_gb": 21.4, "min_vram_gb": 24, "desc": "Qwopus3.5 v3, 27B MQ6" },
 
-    "gemma4:26b-a4b":    { "repo": "", "file": "gemma-4-26b-a4b-it.mq4", "size_gb": 14.8, "min_vram_gb": 16, "desc": "Gemma 4 26B-A4B-it MoE (128 experts / top-8). 128k ctx via sliding ring-buffer + asym3 KV. LOCAL ONLY (Hauhau fine-tune)" }
+    "gemma4:26b-a4b":    { "repo": "", "file": "gemma-4-26b-a4b-it.mq4", "size_gb": 14.8, "min_vram_gb": 16, "desc": "Gemma 4 26B-A4B-it MoE (128 experts / top-8). Sliding KV ring-buffers at 1024 slots; full attention bound to HIPFIRE_KV_SEQ (default 32k, set 131072 for 128k). LOCAL ONLY." }
   },
   "aliases": {
     "gemma4":            "gemma4:26b-a4b",

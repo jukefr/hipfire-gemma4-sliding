@@ -149,6 +149,22 @@ SHORT_TESTS=(
     #   ln -s /data/hipfire/qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq \
     #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-9b.mq4-awq-gptq-f2-lmhead"
     "qwen3.5-9b.mq4-awq-gptq-f2-lmhead|lmhead-awq-paris|What is the capital of France? Answer in one short sentence.|300"
+    # Gemma 4 26B-A4B-it (MoE, 30 MoE layers, asym3 hd=512 KV). Regression
+    # catcher for the gemma4-128k-ring-buffer branch's indexed-MoE dispatch
+    # (gemv_hfq4g256_moe_gate_up_k8_indexed + gemv_hfq4g128_moe_down_*_indexed),
+    # the asym3 hd=512 attention path (attention_flash_asym3_tile_hd512),
+    # and the v_norm sliding-layer call site fixed in 7bd2f43a. Skipped
+    # if the canonical file isn't present.
+    "gemma-4-26b-a4b-it.mq4|gemma4-cap|What is the capital of France? Answer in one short sentence.|80"
+    # Gemma 4 long-context — exercises the sliding-window ring buffer. The
+    # agentic_pi_system.txt prompt is ~1500 tokens, comfortably past the
+    # Gemma 4 26B-A4B-it sliding_window=1024 cap, so reads through the
+    # asym3-hd256 ring (`attention_flash_asym3_window` + writer modulo
+    # sliding_cap). A clean reply confirms the ring-buffer plumbing
+    # (be6b93e6, 7740afd5, 26fd2b3b, 9be6ecff, 36cdfde0) preserves the
+    # right keys at the right slots across wrap.
+    #   md5(agentic_pi_system.txt) = 2d4892884dfeec9fbddfde2a2f47220f
+    "gemma-4-26b-a4b-it.mq4|gemma4-longctx|@agentic_pi_system.txt|80"
 )
 FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"

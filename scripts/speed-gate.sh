@@ -79,7 +79,7 @@ if [ -z "$BASELINE_ARCH" ]; then
 fi
 
 BASELINE_FILE="tests/speed-baselines/${BASELINE_ARCH}.txt"
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-/home/kaden/ClaudeCode/autorocm/hipfire/models}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 
 FAST=0
 UPDATE=0
@@ -236,6 +236,45 @@ _draft_exists() {
 
 bench_dflash_9b_merge_sort() {
     _bench_dflash_merge_sort_core "qwen3.5-9b.mq4" "qwen35-9b-dflash-mq4.hfq"
+}
+
+# Gemma 4 26B-A4B-it bench. Skips silently if model isn't present. Output is
+# advisory — no baseline rows in tests/speed-baselines/*.txt yet, so this is
+# a perf-floor sanity check that prints to stderr and does not affect the
+# gate's overall pass/fail. Capture the first stable run as the baseline and
+# wire `gemma4_26b_a4b_prefill_tok_s` + `_decode_tok_s` into the per-arch file
+# to start enforcing.
+bench_gemma4_26b_a4b() {
+    local model_path=""
+    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
+        [ -f "$dir/gemma-4-26b-a4b-it.mq4" ] && [ -z "$model_path" ] && model_path="$dir/gemma-4-26b-a4b-it.mq4"
+    done
+    if [ -z "$model_path" ]; then
+        echo "MISSING_MODEL"
+        return
+    fi
+    local exe="./target/release/examples/bench_gemma4_mq4"
+    if [ ! -x "$exe" ]; then
+        echo "Building bench_gemma4_mq4 (release)..." >&2
+        cargo build --release -p hipfire-arch-gemma4 --example bench_gemma4_mq4 2>&1 \
+            | grep -E '^(error|   Compiling)' | tail -5 >&2
+        if [ ! -x "$exe" ]; then
+            echo "BUILD_FAIL"
+            return
+        fi
+    fi
+    local out
+    out=$(HIPFIRE_KV_MODE=asym3 HIPFIRE_DPM_WARMUP_SECS=3 \
+        "$exe" "$model_path" --prefill 64 --warmup 5 --gen 50 2>&1 | tail -1)
+    # Expected line: prefill_tok_s=NNN.NN decode_tok_s=NNN.NN ...
+    local p d
+    p=$(echo "$out" | sed -nE 's/.*prefill_tok_s=([0-9.]+).*/\1/p')
+    d=$(echo "$out" | sed -nE 's/.*decode_tok_s=([0-9.]+).*/\1/p')
+    if [ -n "$p" ] && [ -n "$d" ]; then
+        echo "$p $d"
+    else
+        echo "BENCH_FAIL"
+    fi
 }
 
 # Run bench_qwen35_mq4 once at a given prefill size.
