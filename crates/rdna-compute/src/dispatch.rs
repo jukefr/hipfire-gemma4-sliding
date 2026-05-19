@@ -14763,40 +14763,47 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("rope", kernels::ROPE_SRC, "rope_f32")?;
-        let func = &self.functions["rope_f32"];
 
-        let mut q_ptr = q.buf.as_ptr();
-        let mut k_ptr = k.buf.as_ptr();
-        let mut pos_ptr = pos_buf.as_ptr();
-        let mut nhq = n_heads_q as i32;
-        let mut nhk = n_heads_k as i32;
-        let mut hd = head_dim as i32;
-        let mut fb = freq_base;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k.buf.as_ptr();
+        let pos_ptr = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+        let fb = freq_base;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut k_ptr as *mut _ as *mut c_void,
-            &mut pos_ptr as *mut _ as *mut c_void,
-            &mut nhq as *mut _ as *mut c_void,
-            &mut nhk as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut fb as *mut _ as *mut c_void,
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
         ];
 
         let half = (head_dim / 2) as u32;
         let block = 256u32.min(half);
         let grid = (half + block - 1) / block;
 
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "rope_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_f32(fb);
+                b
+            },
+        )
     }
 
     /// Batched RoPE: apply to [batch_size] positions in one launch.
@@ -15837,61 +15844,42 @@ impl Gpu {
             ))),
         };
         self.ensure_givens4_kernel(kernel_name, kernel_src, kernel_name)?;
-        if head_dim == 256 {
+        let kdp = k_dst.buf.as_ptr();
+        let ksp = k_src.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let ctp = cos_theta.buf.as_ptr();
+        let stp = sin_theta.buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let cap = cache_capacity as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &kdp as *const _ as *mut c_void,
+            &ksp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &ctp as *const _ as *mut c_void,
+            &stp as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+        let hd_is_256 = head_dim == 256;
+        if hd_is_256 {
             // hd=256 K-write kernel takes cache_capacity (8 args).
-            let func = &self.functions[kernel_name];
-            let mut kdp = k_dst.buf.as_ptr();
-            let mut ksp = k_src.buf.as_ptr();
-            let mut pp = pos_buf.as_ptr();
-            let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut cap = cache_capacity as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut kdp as *mut _ as *mut c_void,
-                &mut ksp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut ctp as *mut _ as *mut c_void,
-                &mut stp as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut cap as *mut _ as *mut c_void,
-            ];
-            let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
-                    self.stream_ref(), &mut params,
-                )?;
-            }
-        } else {
-            // hd=512 K-write kernel still has original 7-arg signature.
-            let func = &self.functions[kernel_name];
-            let mut kdp = k_dst.buf.as_ptr();
-            let mut ksp = k_src.buf.as_ptr();
-            let mut pp = pos_buf.as_ptr();
-            let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut kdp as *mut _ as *mut c_void,
-                &mut ksp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut ctp as *mut _ as *mut c_void,
-                &mut stp as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-            ];
-            let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
-                    self.stream_ref(), &mut params,
-                )?;
-            }
+            params.push(&cap as *const _ as *mut c_void);
         }
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        self.launch_maybe_blob(
+            kernel_name,
+            [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kdp); b.push_ptr(ksp); b.push_ptr(pp);
+                b.push_ptr(ctp); b.push_ptr(stp);
+                b.push_i32(nkv); b.push_i32(hd);
+                if hd_is_256 { b.push_i32(cap); }
+                b
+            },
+        )?;
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim, cache_capacity)
     }
 
@@ -16725,54 +16713,74 @@ impl Gpu {
         };
         self.ensure_givens4_kernel(kernel_name, kernel_src, kernel_name)?;
         {
-            let func = &self.functions[kernel_name];
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            let mut q_ptr = q.buf.as_ptr();
-            let mut k_ptr = k_cache.buf.as_ptr();
-            let mut v_ptr = v_cache.buf.as_ptr();
-            let mut p_ptr = partials.buf.as_ptr();
-            let mut pos_ptr = pos_buf.as_ptr();
-            let mut ct_ptr = cos_theta.buf.as_ptr();
-            let mut st_ptr = sin_theta.buf.as_ptr();
-            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
-            let mut sc = scale; let mut ts = TILE_SIZE as i32;
-            let mut mt = max_tiles as i32;
-            let mut ws = window_size as i32;
-            let mut cc = cache_capacity as i32;
+            let q_ptr = q.buf.as_ptr();
+            let k_ptr = k_cache.buf.as_ptr();
+            let v_ptr = v_cache.buf.as_ptr();
+            let p_ptr = partials.buf.as_ptr();
+            let pos_ptr = pos_buf.as_ptr();
+            let ct_ptr = cos_theta.buf.as_ptr();
+            let st_ptr = sin_theta.buf.as_ptr();
+            let nh = n_heads as i32; let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32; let ms = max_seq as i32;
+            let sc = scale; let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
+            let ws = window_size as i32;
+            let cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut q_ptr as *mut _ as *mut c_void,
-                &mut k_ptr as *mut _ as *mut c_void,
-                &mut v_ptr as *mut _ as *mut c_void,
-                &mut p_ptr as *mut _ as *mut c_void,
-                &mut pos_ptr as *mut _ as *mut c_void,
-                &mut ct_ptr as *mut _ as *mut c_void,
-                &mut st_ptr as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut ms as *mut _ as *mut c_void,
-                &mut sc as *mut _ as *mut c_void,
-                &mut ts as *mut _ as *mut c_void,
-                &mut mt as *mut _ as *mut c_void,
-                &mut ws as *mut _ as *mut c_void,
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &ct_ptr as *const _ as *mut c_void,
+                &st_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+                &ws as *const _ as *mut c_void,
             ];
             // hd=256 kernel (attention_flash_asym3_tile) accepts the trailing
             // cache_capacity arg; hd=512 (attention_flash_asym3_tile_hd512)
             // does not (back-compat — full layers don't ring-buffer).
             if head_dim == 256 {
-                params.push(&mut cc as *mut _ as *mut c_void);
+                params.push(&cc as *const _ as *mut c_void);
             }
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_heads as u32, launch_tiles as u32, 1],
-                    [32, 1, 1],
-                    (TILE_SIZE * 4) as u32,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            let kn = kernel_name;
+            let hd_for_blob = head_dim;
+            self.launch_maybe_blob(
+                kn,
+                [n_heads as u32, launch_tiles as u32, 1],
+                [32, 1, 1],
+                (TILE_SIZE * 4) as u32,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_ptr(ct_ptr);
+                    b.push_ptr(st_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(ms);
+                    b.push_f32(sc);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b.push_i32(ws);
+                    if hd_for_blob == 256 {
+                        b.push_i32(cc);
+                    }
+                    b
+                },
+            )?;
         }
 
         self.ensure_kernel(
@@ -16781,29 +16789,40 @@ impl Gpu {
             "attention_flash_q8_0_reduce",
         )?;
         {
-            let func = &self.functions["attention_flash_q8_0_reduce"];
-            let mut p_ptr = partials.buf.as_ptr();
-            let mut o_ptr = out.buf.as_ptr();
-            let mut nh = n_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut pos_ptr = pos_buf.as_ptr();
-            let mut ts = TILE_SIZE as i32;
-            let mut mt = max_tiles as i32;
+            let p_ptr = partials.buf.as_ptr();
+            let o_ptr = out.buf.as_ptr();
+            let nh = n_heads as i32;
+            let hd = head_dim as i32;
+            let pos_ptr = pos_buf.as_ptr();
+            let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut p_ptr as *mut _ as *mut c_void,
-                &mut o_ptr as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut pos_ptr as *mut _ as *mut c_void,
-                &mut ts as *mut _ as *mut c_void,
-                &mut mt as *mut _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func, [n_heads as u32, 1, 1], [32, 1, 1], 0,
-                    self.stream_ref(), &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "attention_flash_q8_0_reduce",
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(o_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_ptr(pos_ptr);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b
+                },
+            )?;
         }
         Ok(())
     }
@@ -19803,17 +19822,24 @@ impl Gpu {
     pub fn gelu_tanh_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gelu_tanh_f32", kernels::GELU_TANH_SRC, "gelu_tanh_f32")?;
-        let func = &self.functions["gelu_tanh_f32"];
-        let mut xp = x.buf.as_ptr();
-        let mut op = out.buf.as_ptr();
-        let mut ni = n as i32;
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let ni = n as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
         ];
         let blocks = ((n + 255) / 256) as u32;
-        unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.launch_maybe_blob(
+            "gelu_tanh_f32",
+            [blocks, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(op); b.push_i32(ni);
+                b
+            },
+        )
     }
 
     /// Bias-add: x[batch, n] += bias[n] (in-place, broadcast over batch dim)
