@@ -1,5 +1,21 @@
 #include <hip/hip_runtime.h>
 
+// HFQ4-G128 batched GEMM. Operates on `ceil(K/128)` groups per row — the
+// quantizer pads partial trailing groups with `min_val` so storage is always
+// `ceil(K/128) * 72` bytes.
+//
+// 2026-05-19: ported the partial-trailing-group fix from `gemv_hfq4g128`.
+// The original `K / 128` floor here silently dropped the last partial group
+// (e.g. K=2112 for Gemma 4 dense down_proj: floor=16 vs needed 17 groups),
+// producing dot products missing 64 input elements per row. That manifested
+// end-to-end as the v2 batched-prefill structural-loop attractor traced in
+// docs/investigations/2026-05-19-gemma4-128k-branch-evidence-debt.md.
+// Per-token `gemv_hfq4g128` got this fix when Gemma 4 landed; the batched
+// kernel was missed because the prefill ladder validated qualitatively
+// ("Capital of France?" → "Paris") at d2bb8573 where the down_proj fell
+// through to the per-token GEMV loop, and the 521161f8 commit that routed
+// HFQ4G128 through `gemm_hfq4g128` shipped without re-running coherence.
+
 #define BATCH_TILE 8
 
 __launch_bounds__(32, 16)
@@ -14,7 +30,7 @@ extern "C" __global__ void gemm_hfq4g128(
     const int batch_start = blockIdx.y * BATCH_TILE;
     const int tid = threadIdx.x;
 
-    const int groups_per_row = K / 128;
+    const int groups_per_row = (K + 127) / 128;
     const int row_bytes = groups_per_row * 72;
     const char* row_ptr = A + (long long)row * row_bytes;
 
@@ -42,10 +58,23 @@ extern "C" __global__ void gemm_hfq4g128(
         float w2 = scale * (float)(b1 & 0xF) + zero;
         float w3 = scale * (float)(b1 >> 4)  + zero;
 
-        for (int b = 0; b < local_bs; b++) {
-            const float* xb = x + (batch_start + b) * K;
-            acc[b] += w0 * xb[base_k]     + w1 * xb[base_k + 1]
-                    + w2 * xb[base_k + 2] + w3 * xb[base_k + 3];
+        // Fast path: all 4 indices in range. Branchless for the common case.
+        if (base_k + 3 < K) {
+            for (int b = 0; b < local_bs; b++) {
+                const float* xb = x + (batch_start + b) * K;
+                acc[b] += w0 * xb[base_k]     + w1 * xb[base_k + 1]
+                        + w2 * xb[base_k + 2] + w3 * xb[base_k + 3];
+            }
+        } else {
+            // Partial last group: per-element bounds check. Mirrors the
+            // gemv_hfq4g128 fix exactly.
+            for (int b = 0; b < local_bs; b++) {
+                const float* xb = x + (batch_start + b) * K;
+                if (base_k + 0 < K) acc[b] += w0 * xb[base_k + 0];
+                if (base_k + 1 < K) acc[b] += w1 * xb[base_k + 1];
+                if (base_k + 2 < K) acc[b] += w2 * xb[base_k + 2];
+                if (base_k + 3 < K) acc[b] += w3 * xb[base_k + 3];
+            }
         }
     }
 

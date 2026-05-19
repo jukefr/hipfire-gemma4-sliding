@@ -3511,6 +3511,13 @@ fn generate_gemma4(
     // copy cost. Threshold tuned for 26B-A4B on gfx1201; smaller chunks fall
     // through to the per-token loop (which also handles correctness gracefully
     // for non-MoE Gemma 4 variants).
+    //
+    // Default-on again as of 2026-05-19: `gemma4::forward_prefill_batch` is
+    // routed to v1 (per-token attn+FFN + batched MoE) — the known-good path
+    // from d2bb8573 — instead of v2 (introduced in 521161f8). v2 produced a
+    // structural-loop attractor on greedy decode; v1 ships the +38%
+    // launch-overhead win without the regression. Set HIPFIRE_PREFILL_BATCH=0
+    // to fall through to the strictly-per-token path if v1 ever regresses.
     const PREFILL_BATCH_THRESHOLD: usize = 16;
     const PREFILL_BATCH_SIZE: usize = 128;
     let use_batched = prefill_len >= PREFILL_BATCH_THRESHOLD

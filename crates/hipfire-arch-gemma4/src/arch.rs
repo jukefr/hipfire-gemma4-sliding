@@ -77,27 +77,32 @@ impl Architecture for Gemma4 {
     // dispatcher knows to expect them.
 
     fn prompt_frame_overrides(_cfg: &Self::Config) -> PromptFrameOverrides {
-        // Gemma 4 uses `<start_of_turn>user\n…<end_of_turn>\n<start_of_turn>model\n`
-        // framing, NOT ChatML. The current `PromptFrameOverrides` only
-        // carries a `raw: Option<bool>` flag — Gemma's framing is
-        // neither raw-completion nor ChatML, so it requires a
-        // dedicated branch in `hipfire_runtime::prompt_frame` with a
-        // `start_of_turn` / `end_of_turn` literal-token strategy.
-        // Tracking issue: TODO when the SPM-BPE tokenizer port lands.
+        // NOTE: currently dead code — `daemon.rs` special-cases Gemma 4
+        // via `gemma4_build_scaffold` and never consults the Architecture
+        // trait for prompt framing. Kept for the eventual trait-dispatch
+        // migration.
+        //
+        // The string literals below describe the documented
+        // `<start_of_turn>` / `<end_of_turn>` framing, but the daemon
+        // scaffold actually emits `<|turn>` (id 105) / `<turn|>` (id 106)
+        // because those are the special tokens present in the shipped
+        // `gemma-4-26b-a4b-it.mq4` tokenizer. A future trait-dispatched
+        // frame builder must derive literals from the tokenizer's
+        // special-token table at load time, not from hard-coded bytes.
         PromptFrameOverrides::default()
     }
 
     fn eos_filter_overrides(_cfg: &Self::Config) -> EosFilterOverrides {
-        // Gemma's end-of-turn marker is `<end_of_turn>` (literal token,
-        // id varies by sub-variant — read from tokenizer at load time).
-        // The `EosFilterOverrides::stop_at: Vec<Vec<u8>>` field already
-        // exists for exactly this — populate once the tokenizer is
-        // wired through. Holdback prefix is the partial-match sequence
-        // `b"<end_"` to prevent leaking the marker bytes into the
-        // visible stream while the tokenizer disambiguates.
+        // NOTE: dead code (see prompt_frame_overrides above). The shipped
+        // `gemma-4-26b-a4b-it.mq4` model closes turns with `<turn|>`
+        // (id 106), and other Gemma 4 checkpoints may use `<end_of_turn>`
+        // or other tokens. Hard-coding either set here would be wrong for
+        // the other. Empty stop_at + a strip_think hint is the only
+        // honest default until trait dispatch reads from the tokenizer's
+        // special-token table at load time.
         EosFilterOverrides {
-            stop_at: vec![b"<end_of_turn>".to_vec()],
-            holdback_prefixes: vec![b"<end_".to_vec()],
+            stop_at: vec![],
+            holdback_prefixes: vec![],
             strip_think: Some(false), // Gemma 4 is not a thinking-mode model
         }
     }
