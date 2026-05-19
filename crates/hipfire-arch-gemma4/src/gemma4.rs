@@ -1564,16 +1564,30 @@ pub fn forward_scratch(
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
 
     // hipGraph capture/replay policy.
-    //   - DEFAULT-OFF for Gemma 4. The captured graph produces incorrect
-    //     output on the first replay — the model emits multilingual
-    //     gibberish instead of the direct path's clean answer
-    //     ("get own el 싶 kreatif 博文 …" rather than "Paris"). Same class
-    //     of issue as the Qwen35 MoE-graph drift (see qwen35.rs ~3070
-    //     comment block): some kernel in the MoE forward path captures +
-    //     replays with non-bit-identical semantics. Suspected culprit is
-    //     the indexed-down atomicAdd accumulation order across blocks,
-    //     but not yet root-caused.
-    //   - HIPFIRE_GRAPH=1 to opt in for debugging.
+    //   - DEFAULT-OFF for Gemma 4.
+    //   - Root cause (Phase C bisect, 2026-05-19): the captured graph emits
+    //     saturated-softcap logits (top-5 all at ±29.99…) on every replay
+    //     because `kv_len = pos + 1` is passed as a SCALAR kernel argument
+    //     to every attention_flash_*_window dispatch site (sliding +
+    //     full layers, see calls below — `pos + 1` is the literal arg).
+    //     hipGraph bakes scalar args at capture time, so on every replay
+    //     the captured attention kernels read only K/V slots [0, captured_pos],
+    //     missing every freshly-written KV slot from kv_cache_write at the
+    //     new pos. The attention output is computed against an INCOMPLETE
+    //     KV history → drift → residual blow-up → softcap saturation.
+    //     `pos_buf` (the device int32) IS read correctly by rope_f32,
+    //     kv_cache_write*, and the attention kernels' RoPE-phase path —
+    //     those propagate the new pos. The bug is specifically the
+    //     `kv_len` upper-bound scalar.
+    //   - Fix path (NOT YET LANDED — keeps graph off-by-default):
+    //     thread kv_len through pos_buf as a derived `kv_len_buf` device
+    //     value, written via stream_write_value32 right before the captured
+    //     attention dispatch, and read by the kernel as a scalar load.
+    //     Touches every attention_flash_*_window kernel signature (~7
+    //     kernels) and the Rust dispatch helpers. Out of scope for this
+    //     session; recorded for the next graph-capture push.
+    //   - HIPFIRE_GRAPH=1 to opt in for debugging (still broken, but the
+    //     env knob is wired so the next bisect can use it).
     //   - Compact offset != 0 (TriAttention eviction) also breaks capture
     //     for the same reason as Qwen35 — bail to direct in that case.
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
