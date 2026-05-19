@@ -41,7 +41,11 @@ __global__ void attention_flash_asym3_tile_batched(
     // Sliding-window lookback (Gemma 4). 0 = no window / full causal.
     // Tree-mode + sliding is not currently used; the predicate below ignores
     // window_size whenever tree_mode is active so DDTree paths are unaffected.
-    int window_size
+    int window_size,
+    // Ring-buffer cache capacity (Gemma 4 sliding-layer KV). 0 = no wrap;
+    // slot = t directly. > 0: slot = t % cache_capacity. Must agree with the
+    // matching kv_cache_write_asym_k_givens3_batched's cache_capacity.
+    int cache_capacity
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -116,7 +120,8 @@ __global__ void attention_flash_asym3_tile_batched(
         const bool out_of_window = sliding && (t < t_lo);
         float partial = 0.0f;
         if (!out_of_window) {
-            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+            const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+            const unsigned char* kb = k_cache + (size_t)k_slot * k_bytes_per_pos + k_head_off;
             float cnorm = *(const float*)kb;
             const unsigned char* base = kb + 4 + tid * 3;
             unsigned int packed = (unsigned int)base[0]
@@ -171,7 +176,8 @@ __global__ void attention_flash_asym3_tile_batched(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+        const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int d = d0 + i;

@@ -15444,16 +15444,20 @@ impl Gpu {
     pub fn kv_cache_write_q8_0_batched(
         &mut self, dst: &GpuTensor, src: &GpuTensor, positions: &GpuTensor,
         n_kv_heads: usize, head_dim: usize, batch_size: usize,
+        // Ring-buffer cache_capacity (Gemma 4 sliding-layer V cache). 0 = no wrap.
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("kv_cache_write_q8_0_batched", kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC, "kv_cache_write_q8_0_batched")?;
         let mut d = dst.buf.as_ptr(); let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
         let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32; let mut bs = batch_size as i32;
+        let mut cc = cache_capacity as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
             &mut p as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void, &mut bs as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
         self.launch_maybe_blob(
@@ -15462,7 +15466,7 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(d); b.push_ptr(s); b.push_ptr(p);
-                b.push_i32(nkv); b.push_i32(hd); b.push_i32(bs);
+                b.push_i32(nkv); b.push_i32(hd); b.push_i32(bs); b.push_i32(cc);
                 b
             },
         )
@@ -15989,6 +15993,10 @@ impl Gpu {
         k_dst: &GpuTensor, k_src: &GpuTensor, positions: &GpuTensor,
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize, batch_size: usize,
+        // Ring-buffer cache_capacity (Gemma 4 sliding layer). 0 = no wrap.
+        // The kernels that don't have ring-buffer ignore this arg (extra
+        // tail kernarg byte is tolerated by HIP).
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.ensure_givens4_kernel(kernel_key, src_const, func_name)?;
         let mut kdp = k_dst.buf.as_ptr();
@@ -15999,6 +16007,7 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
+        let mut cc = cache_capacity as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut kdp as *mut _ as *mut c_void,
             &mut ksp as *mut _ as *mut c_void,
@@ -16008,6 +16017,7 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
         ];
         let shared_mem = ((head_dim + 32) * 4) as u32;
         self.launch_maybe_blob(
@@ -16020,7 +16030,7 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(kdp); b.push_ptr(ksp); b.push_ptr(pp);
                 b.push_ptr(ctp); b.push_ptr(stp);
-                b.push_i32(nkv); b.push_i32(hd); b.push_i32(bs);
+                b.push_i32(nkv); b.push_i32(hd); b.push_i32(bs); b.push_i32(cc);
                 b
             },
         )
@@ -16050,6 +16060,11 @@ impl Gpu {
         // mode + sliding is currently disjoint; the kernels guard against
         // both being active simultaneously.
         window_size: u32,
+        // Ring-buffer cache capacity (Gemma 4 sliding layer). 0 = no wrap,
+        // slot = t directly. > 0: slot = t % cache_capacity. Only the asym3
+        // tile kernel reads this arg; others ignore it (extra kernarg byte
+        // is tolerated by HIP).
+        cache_capacity: u32,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
@@ -16094,6 +16109,7 @@ impl Gpu {
                 let mt = max_tiles as i32; let bo = offset as i32;
                 let bs = block_start as i32; let bc = block_cols as i32;
                 let ws = window_size as i32;
+                let cc = cache_capacity as i32;
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -16114,6 +16130,7 @@ impl Gpu {
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
                     &ws as *const _ as *mut c_void,
+                    &cc as *const _ as *mut c_void,
                 ];
                 self.launch_maybe_blob(
                     tile_func_name,
@@ -16128,7 +16145,7 @@ impl Gpu {
                         b.push_ptr(ct_ptr); b.push_ptr(st_ptr); b.push_ptr(bias_ptr);
                         b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
                         b.push_f32(sc); b.push_i32(ts); b.push_i32(mt); b.push_i32(bo);
-                        b.push_i32(bs); b.push_i32(bc); b.push_i32(ws);
+                        b.push_i32(bs); b.push_i32(bc); b.push_i32(ws); b.push_i32(cc);
                         b
                     },
                 )?;
@@ -16190,8 +16207,9 @@ impl Gpu {
             "kv_cache_write_asym_k_givens4_batched",
             k_dst, k_src, positions, cos_theta, sin_theta,
             n_kv_heads, head_dim, batch_size,
+            0, // cache_capacity: no ring buffer
         )?;
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, 0)
     }
 
     /// Batched K+V write for fwht4 (K FWHT-rotated 4-bit + V Q8_0).
@@ -16211,8 +16229,9 @@ impl Gpu {
             "kv_cache_write_asym_k_fwht4_batched",
             k_dst, k_src, positions, signs1, signs2,
             n_kv_heads, head_dim, batch_size,
+            0, // cache_capacity: no ring buffer
         )?;
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, 0)
     }
 
     /// Batched K+V write for asym2 (K 2-bit rotated + V Q8_0).
@@ -16230,8 +16249,9 @@ impl Gpu {
             "kv_cache_write_asym_k_givens2_batched",
             k_dst, k_src, positions, cos_theta, sin_theta,
             n_kv_heads, head_dim, batch_size,
+            0, // cache_capacity: no ring buffer
         )?;
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, 0)
     }
 
     /// Batched K+V write for fwht2 (K FWHT-rotated 2-bit + V Q8_0).
@@ -16249,8 +16269,9 @@ impl Gpu {
             "kv_cache_write_asym_k_fwht2_batched",
             k_dst, k_src, positions, signs1, signs2,
             n_kv_heads, head_dim, batch_size,
+            0, // cache_capacity: no ring buffer
         )?;
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, 0)
     }
 
     /// Batched flash attention for asym4 (K 4-bit rotated + V Q8_0).
@@ -16296,6 +16317,7 @@ impl Gpu {
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
             0, // window_size: full causal (Qwen 3.5 / 3.6)
+            0, // cache_capacity: no ring buffer
         )
     }
 
@@ -16342,6 +16364,7 @@ impl Gpu {
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
             0, // window_size: full causal (no Gemma-4 sliding window on FWHT path)
+            0, // cache_capacity: no ring buffer
         )
     }
 
@@ -16364,6 +16387,7 @@ impl Gpu {
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             None, 0, 0,
             0, // window_size: full causal (Qwen 3.5 / 3.6)
+            0, // cache_capacity: no ring buffer
         )
     }
 
@@ -16386,6 +16410,7 @@ impl Gpu {
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             None, 0, 0,
             0, // window_size: full causal (no Gemma-4 sliding window on FWHT path)
+            0, // cache_capacity: no ring buffer
         )
     }
 
@@ -16399,6 +16424,9 @@ impl Gpu {
         k_src: &GpuTensor, v_src: &GpuTensor, positions: &GpuTensor,
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         n_kv_heads: usize, head_dim: usize, batch_size: usize,
+        // Ring-buffer cache_capacity (Gemma 4 sliding layer hd=256). 0 = no wrap.
+        // hd=512 (full layers) always passes 0 — those caches are direct.
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // K: batched 3-bit rotated write — branch by head_dim.
@@ -16419,6 +16447,7 @@ impl Gpu {
             let mut nkv = n_kv_heads as i32;
             let mut hd = head_dim as i32;
             let mut bs = batch_size as i32;
+            let mut cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut kdp as *mut _ as *mut c_void,
                 &mut ksp as *mut _ as *mut c_void,
@@ -16428,6 +16457,7 @@ impl Gpu {
                 &mut nkv as *mut _ as *mut c_void,
                 &mut hd as *mut _ as *mut c_void,
                 &mut bs as *mut _ as *mut c_void,
+                &mut cc as *mut _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
             self.launch_maybe_blob(
@@ -16440,13 +16470,13 @@ impl Gpu {
                     let mut b = hip_bridge::KernargBlob::new();
                     b.push_ptr(kdp); b.push_ptr(ksp); b.push_ptr(pp);
                     b.push_ptr(ctp); b.push_ptr(stp);
-                    b.push_i32(nkv); b.push_i32(hd); b.push_i32(bs);
+                    b.push_i32(nkv); b.push_i32(hd); b.push_i32(bs); b.push_i32(cc);
                     b
                 },
             )?;
         }
-        // V: batched Q8_0 write.
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        // V: batched Q8_0 write (with matching ring buffer).
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, cache_capacity)
     }
 
     /// Batched K+V write for fwht3 (K FWHT-rotated 3-bit + V Q8_0).
@@ -16498,7 +16528,7 @@ impl Gpu {
                 },
             )?;
         }
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, 0)
     }
 
     /// Batched flash attention for asym3 KV.
@@ -16545,6 +16575,35 @@ impl Gpu {
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
             0, // window_size: full causal (Qwen 3.5 / 3.6)
+            0, // cache_capacity: no ring buffer
+        )
+    }
+
+    /// Batched flash attention for asym3 with sliding window + ring buffer.
+    /// Gemma 4 sliding-layer prefill: window_size = 1024, cache_capacity = 1024.
+    /// Replaces the per-token attention_flash_asym3_window loop inside
+    /// forward_prefill_batch_v2; eliminates 30*n_batch micro-launches per chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym3_batched_window(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
+        window_size: u32,
+        cache_capacity: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_asym3_tile_batched",
+            kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
+            "attention_flash_asym3_tile_batched",
+            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            None, 0, 0,
+            window_size,
+            cache_capacity,
         )
     }
 
@@ -16588,6 +16647,7 @@ impl Gpu {
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
             0, // window_size: full causal (no Gemma-4 sliding window on FWHT path)
+            0, // cache_capacity: no ring buffer
         )
     }
 

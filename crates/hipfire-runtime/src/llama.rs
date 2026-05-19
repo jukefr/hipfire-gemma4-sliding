@@ -1289,8 +1289,8 @@ pub fn prefill_forward(
 
         // Batched KV cache write: all positions in 2 kernel launches (K + V)
         if kv_cache.quantized && kv_cache.quant_q8 {
-            gpu.kv_cache_write_q8_0_batched(&kv_cache.k_gpu[layer_idx], &k_batch, &pos_array, n_kv_heads, head_dim, batch)?;
-            gpu.kv_cache_write_q8_0_batched(&kv_cache.v_gpu[layer_idx], &v_batch, &pos_array, n_kv_heads, head_dim, batch)?;
+            gpu.kv_cache_write_q8_0_batched(&kv_cache.k_gpu[layer_idx], &k_batch, &pos_array, n_kv_heads, head_dim, batch, 0)?;
+            gpu.kv_cache_write_q8_0_batched(&kv_cache.v_gpu[layer_idx], &v_batch, &pos_array, n_kv_heads, head_dim, batch, 0)?;
         } else {
             for i in 0..batch {
                 let pos_i32 = i as i32;
@@ -1853,7 +1853,7 @@ fn forward_prefill_chunk(
             gpu.kv_cache_write_asym3_batched(
                 &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                ct, st, config.n_kv_heads, config.head_dim, n,
+                ct, st, config.n_kv_heads, config.head_dim, n, 0,
             )?;
         } else if kv_cache.quant_asym2 {
             let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -1866,11 +1866,11 @@ fn forward_prefill_chunk(
         } else {
             gpu.kv_cache_write_q8_0_batched(
                 &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
-                config.n_kv_heads, config.head_dim, n,
+                config.n_kv_heads, config.head_dim, n, 0,
             )?;
             gpu.kv_cache_write_q8_0_batched(
                 &kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions,
-                config.n_kv_heads, config.head_dim, n,
+                config.n_kv_heads, config.head_dim, n, 0,
             )?;
         }
 

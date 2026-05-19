@@ -16,13 +16,18 @@ extern "C" __global__ void kv_cache_write_asym_k_givens3_batched(
     const float* __restrict__ sin_theta,
     int n_kv_heads,
     int head_dim,
-    int batch_size
+    int batch_size,
+    // Ring-buffer cache capacity. 0 = no wrap; slot = pos directly.
+    // > 0: slot = pos % cache_capacity. Must match the matching
+    // attention_flash_asym3_tile_batched cache_capacity.
+    int cache_capacity
 ) {
     const int h = blockIdx.x;
     const int bid = blockIdx.y;
     if (h >= n_kv_heads || bid >= batch_size) return;
     const int tid = threadIdx.x;
     const int pos = positions[bid];
+    const int slot = (cache_capacity > 0) ? (pos % cache_capacity) : pos;
 
     const int kv_dim = n_kv_heads * head_dim;
     const int bytes_per_head = 4 + (head_dim * 3) / 8;
@@ -89,7 +94,7 @@ extern "C" __global__ void kv_cache_write_asym_k_givens3_batched(
     float recon_norm = sqrtf(scratch[0]);
     float cnorm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
 
-    unsigned char* out = k_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+    unsigned char* out = k_dst + (size_t)slot * bytes_per_pos + h * bytes_per_head;
     if (tid == 0) *(float*)out = cnorm;
 
     unsigned int packed = 0;

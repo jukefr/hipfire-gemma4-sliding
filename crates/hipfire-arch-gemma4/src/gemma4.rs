@@ -2458,52 +2458,35 @@ fn forward_prefill_batch_v2(
                     dbg_dump(gpu, "[v2] L0 after rope_k", &scratch.pb_k, kv_dim);
                 }
 
-                for i in 0..n_batch {
-                    let pos = start_pos + i;
-                    if let Some(stream) = gpu.active_stream.as_ref() {
-                        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
-                    } else {
-                        let pos_i32 = pos as i32;
-                        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-                    }
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
-                    }
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                    }
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                    }
-                    let ct = kv_sliding.givens_cos.as_ref().unwrap();
-                    let st = kv_sliding.givens_sin.as_ref().unwrap();
-                    let sliding_cap = config.sliding_window as u32;
-                    gpu.kv_cache_write_asym3_fused(
-                        &kv_sliding.k_gpu[sliding_kv_idx], &kv_sliding.v_gpu[sliding_kv_idx],
-                        &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim,
-                        sliding_cap)?;
-                    gpu.attention_flash_asym3_window(
-                        &scratch.q, &kv_sliding.k_gpu[sliding_kv_idx], &kv_sliding.v_gpu[sliding_kv_idx],
-                        &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
-                        n_heads, n_kv, head_dim, kv_sliding.max_seq,
-                        &scratch.flash_partials,
-                        sliding_cap, sliding_cap,
-                    )?;
-                    if _dump_on && i == 0 {
-                        dbg_dump(gpu, "[v2] L0 after attention (scratch)", &scratch.attn_out, n_heads * head_dim);
-                    }
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes)?;
-                    }
-                }
+                // 2026-05-19: replaced the per-token attention loop with a single
+                // batched kv_cache_write + attention dispatch. Eliminates
+                // ~30 × n_batch micro-launches per chunk (was 30 layers × 128
+                // tokens × (pos_buf htod + 3 memcpy + kv_write + attn + memcpy) =
+                // ~15,000 launches per 128-token chunk). The batched kernels
+                // accept pb_positions (host-staged i32 array) + cache_capacity
+                // (ring-buffer modulo for sliding KV).
+                let ct = kv_sliding.givens_cos.as_ref().unwrap();
+                let st = kv_sliding.givens_sin.as_ref().unwrap();
+                let sliding_cap = config.sliding_window as u32;
+                gpu.kv_cache_write_asym3_batched(
+                    &kv_sliding.k_gpu[sliding_kv_idx], &kv_sliding.v_gpu[sliding_kv_idx],
+                    &scratch.pb_k, &scratch.pb_v, &scratch.pb_positions,
+                    ct, st, n_kv, head_dim, n_batch, sliding_cap,
+                )?;
+                // max_ctx_len = upper bound on observed seq_len for max_tiles
+                // sizing. Use start_pos + n_batch (the highest pos this chunk
+                // touches) so attention reduce sweeps the right tile count.
+                let max_ctx_len = start_pos + n_batch;
+                gpu.attention_flash_asym3_batched_window(
+                    &scratch.pb_q,                                         // q [n_batch × q_dim]
+                    &kv_sliding.k_gpu[sliding_kv_idx], &kv_sliding.v_gpu[sliding_kv_idx],
+                    &scratch.pb_q,                                         // out aliases q (safe — tile reads q first, reduce writes out last)
+                    &scratch.pb_positions, ct, st,
+                    n_heads, n_kv, head_dim,
+                    kv_sliding.max_seq, max_ctx_len, n_batch,
+                    &scratch.flash_partials,
+                    sliding_cap, sliding_cap,
+                )?;
                 sliding_kv_idx += 1;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after attention (pb_q)", &scratch.pb_q, q_dim); }
 

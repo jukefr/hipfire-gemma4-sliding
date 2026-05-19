@@ -5101,13 +5101,13 @@ fn forward_prefill_chunk(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     } else {
                         gpu.kv_cache_write_asym4_batched(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     }
                 } else if kv_cache.quant_asym3 {
                     let ct = givens_cos_view!().unwrap();
@@ -5117,13 +5117,13 @@ fn forward_prefill_chunk(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     } else {
                         gpu.kv_cache_write_asym3_batched(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                            ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+                            ct, st, config.n_kv_heads, config.head_dim, n, 0,
+)?;
                     }
                 } else if kv_cache.quant_asym2 {
                     let ct = givens_cos_view!().unwrap();
@@ -5133,23 +5133,23 @@ fn forward_prefill_chunk(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     } else {
                         gpu.kv_cache_write_asym2_batched(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     }
                 } else {
                     gpu.kv_cache_write_q8_0_batched(
                         &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
-                        config.n_kv_heads, config.head_dim, n,
-                    )?;
+                        config.n_kv_heads, config.head_dim, n, 0,
+)?;
                     gpu.kv_cache_write_q8_0_batched(
                         &kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions,
-                        config.n_kv_heads, config.head_dim, n,
-                    )?;
+                        config.n_kv_heads, config.head_dim, n, 0,
+)?;
                 }
 
                 // 7. Batched causal attention (or tree-attention if tree_verify is set).
@@ -5782,13 +5782,13 @@ fn forward_prefill_chunk(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     } else {
                         gpu.kv_cache_write_asym4_batched(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     }
                 } else if kv_cache.quant_asym3 {
                     let ct = givens_cos_view!().unwrap();
@@ -5798,13 +5798,13 @@ fn forward_prefill_chunk(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     } else {
                         gpu.kv_cache_write_asym3_batched(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
-                            ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+                            ct, st, config.n_kv_heads, config.head_dim, n, 0,
+)?;
                     }
                 } else if kv_cache.quant_asym2 {
                     let ct = givens_cos_view!().unwrap();
@@ -5814,23 +5814,23 @@ fn forward_prefill_chunk(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     } else {
                         gpu.kv_cache_write_asym2_batched(
                             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
                             ct, st, config.n_kv_heads, config.head_dim, n,
-                        )?;
+)?;
                     }
                 } else {
                     gpu.kv_cache_write_q8_0_batched(
                         &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
-                        config.n_kv_heads, config.head_dim, n,
-                    )?;
+                        config.n_kv_heads, config.head_dim, n, 0,
+)?;
                     gpu.kv_cache_write_q8_0_batched(
                         &kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions,
-                        config.n_kv_heads, config.head_dim, n,
-                    )?;
+                        config.n_kv_heads, config.head_dim, n, 0,
+)?;
                 }
                 const LDS_CTX_LIMIT: usize = 15000;
                 let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);

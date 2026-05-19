@@ -6,7 +6,10 @@ extern "C" __global__ void kv_cache_write_q8_0_batched(
     const int* __restrict__ positions,    // [batch_size]
     int n_kv_heads,
     int head_dim,
-    int batch_size
+    int batch_size,
+    // Ring-buffer cache capacity. 0 = no wrap; slot = pos directly.
+    // Pairs with the matching K-side kernel's cache_capacity.
+    int cache_capacity
 ) {
     const int gid = blockIdx.x;           // Q8_0 block index within one position
     const int bid = blockIdx.y;           // batch index
@@ -35,7 +38,8 @@ extern "C" __global__ void kv_cache_write_q8_0_batched(
     int q = __float2int_rn(val * inv_scale);
     q = max(-127, min(127, q));
 
-    unsigned char* out = dst + (size_t)pos * total_blocks * 34 + gid * 34;
+    const int slot = (cache_capacity > 0) ? (pos % cache_capacity) : pos;
+    unsigned char* out = dst + (size_t)slot * total_blocks * 34 + gid * 34;
     if (tid == 0) *((_Float16*)(out)) = (_Float16)scale;
     out[2 + tid] = (unsigned char)(signed char)q;
 }

@@ -4408,8 +4408,8 @@ pub fn spec_step_ddtree_batched(
                     &kv.k_gpu[layer_idx], &kv.v_gpu[layer_idx],
                     &pbs.fa_k_batch, &pbs.fa_v_batch,
                     &scratch.kv_gather_indices,
-                    ct, st, n_kv_heads, head_dim, n_positions,
-                )?;
+                    ct, st, n_kv_heads, head_dim, n_positions, 0,
+)?;
                 // V byte-gather: read pre-quantized V from raced slots
                 // [position+0, position+1+acc[0], ...] into a contiguous
                 // scratch, then memcpy scratch → kv.v_gpu at committed
