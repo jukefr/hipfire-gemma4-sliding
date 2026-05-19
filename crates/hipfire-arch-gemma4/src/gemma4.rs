@@ -15,7 +15,7 @@
 //!   • Embed scale: sqrt(hidden_size) multiplied onto every embedding row lookup.
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, WeightTensor, EmbeddingFormat};
+use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, weight_gemm, WeightTensor, EmbeddingFormat};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -877,6 +877,41 @@ pub struct Gemma4Scratch {
     /// `[k_top × 2 × mi]` — fused gate+up output, one row per top-K rank.
     pub moe_expert_gate_batch: GpuTensor, // [k_top × mi]
     pub moe_expert_up_batch:   GpuTensor, // [k_top × mi]
+
+    // ── Prefill-batch (N tokens at a time) scratch ─────────────────────
+    // Sized for max_prefill_batch tokens. Used by forward_prefill_chunk to
+    // amortize MoE launch overhead across N tokens via the batched-indexed
+    // kernels. None on models with no MoE (n_experts==0).
+    pub max_prefill_batch: usize,
+    /// `[N × dim]` — per-token attention output after o_proj (before residual).
+    pub pb_attn_out: GpuTensor,
+    /// `[N × dim]` — per-token dense FFN output (gemma4 26B-A4B-it computes
+    /// this in parallel to MoE; both feed the sandwich norm).
+    pub pb_ffn_out: GpuTensor,
+    /// `[N × dim]` — pre-norm-2(attn_out) for each token.
+    pub pb_moe_pre2: GpuTensor,
+    /// `[N × dim]` — FWHT-rotated pre2 (MQ4 gate_up expects rotated x).
+    pub pb_moe_pre2_rot: GpuTensor,
+    /// `[N × dim]` — router input (rmsnorm(attn_out, router_scale) / sqrt(dim)).
+    pub pb_moe_router_in: GpuTensor,
+    /// `[N × n_experts]` — router logits batched.
+    pub pb_moe_router_logits: GpuTensor,
+    /// `[N × k_top]` i32 — top-K expert indices per token.
+    pub pb_moe_topk_indices: GpuTensor,
+    /// `[N × k_top]` — renormalized top-K weights per token.
+    pub pb_moe_topk_weights: GpuTensor,
+    /// `[N × k_top × mi]` — gate output across tokens × experts.
+    pub pb_moe_gate_batch: GpuTensor,
+    /// `[N × k_top × mi]` — up output across tokens × experts.
+    pub pb_moe_up_batch: GpuTensor,
+    /// `[N × k_top × mi]` — gelu_tanh(gate) * up.
+    pub pb_moe_hidden_batch: GpuTensor,
+    /// `[N × dim]` — accumulator for MoE branch output per token.
+    pub pb_moe_cur_moe: GpuTensor,
+    /// `[N × dim]` — post_norm_1(ffn_out) per token (dense branch).
+    pub pb_moe_cur_mlp: GpuTensor,
+    /// `[N × dim]` — residual stream per token across the prefill batch.
+    pub pb_residual: GpuTensor,
     /// `[k_top × mi]` — gelu_tanh(gate)*up batched over k_top experts.
     pub moe_expert_hidden_batch: GpuTensor,
 }
@@ -965,6 +1000,26 @@ impl Gemma4Scratch {
         let moe_expert_up_batch   = gpu.zeros(&[k_top * mi], DType::F32)?;
         let moe_expert_hidden_batch = gpu.zeros(&[k_top * mi], DType::F32)?;
 
+        // Prefill-batch scratch (N tokens at once). MAX_PREFILL_BATCH=64
+        // is a tuning constant — larger batches mean more concurrent GPU
+        // work but proportionally more VRAM. 64 × dim=2816 × f32 = 720 KB
+        // for the main residual; total batch scratch ≈ 10 MB.
+        const MAX_PREFILL_BATCH: usize = 64;
+        let pb_attn_out          = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_ffn_out           = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_pre2          = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_pre2_rot      = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_router_in     = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_router_logits = gpu.zeros(&[MAX_PREFILL_BATCH, n_exp], DType::F32)?;
+        let pb_moe_topk_indices  = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
+        let pb_moe_topk_weights  = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
+        let pb_moe_gate_batch    = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
+        let pb_moe_up_batch      = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
+        let pb_moe_hidden_batch  = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
+        let pb_moe_cur_moe       = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_cur_mlp       = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_residual          = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+
         Ok(Gemma4Scratch {
             x, residual, tmp, pos_buf,
             q, k, v, attn_out,
@@ -979,6 +1034,13 @@ impl Gemma4Scratch {
             moe_pre2_rot,
             moe_expert_gate_batch, moe_expert_up_batch,
             moe_expert_hidden_batch,
+            max_prefill_batch: MAX_PREFILL_BATCH,
+            pb_attn_out, pb_ffn_out,
+            pb_moe_pre2, pb_moe_pre2_rot,
+            pb_moe_router_in, pb_moe_router_logits,
+            pb_moe_topk_indices, pb_moe_topk_weights,
+            pb_moe_gate_batch, pb_moe_up_batch, pb_moe_hidden_batch,
+            pb_moe_cur_moe, pb_moe_cur_mlp, pb_residual,
         })
     }
 
@@ -1021,6 +1083,20 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.moe_expert_gate_batch);
         let _ = gpu.free_tensor(self.moe_expert_up_batch);
         let _ = gpu.free_tensor(self.moe_expert_hidden_batch);
+        let _ = gpu.free_tensor(self.pb_attn_out);
+        let _ = gpu.free_tensor(self.pb_ffn_out);
+        let _ = gpu.free_tensor(self.pb_moe_pre2);
+        let _ = gpu.free_tensor(self.pb_moe_pre2_rot);
+        let _ = gpu.free_tensor(self.pb_moe_router_in);
+        let _ = gpu.free_tensor(self.pb_moe_router_logits);
+        let _ = gpu.free_tensor(self.pb_moe_topk_indices);
+        let _ = gpu.free_tensor(self.pb_moe_topk_weights);
+        let _ = gpu.free_tensor(self.pb_moe_gate_batch);
+        let _ = gpu.free_tensor(self.pb_moe_up_batch);
+        let _ = gpu.free_tensor(self.pb_moe_hidden_batch);
+        let _ = gpu.free_tensor(self.pb_moe_cur_moe);
+        let _ = gpu.free_tensor(self.pb_moe_cur_mlp);
+        let _ = gpu.free_tensor(self.pb_residual);
     }
 }
 
@@ -1231,6 +1307,137 @@ fn apply_moe_branch(
     Ok(())
 }
 
+/// Batched MoE branch — processes N tokens at once. Mirrors `apply_moe_branch`
+/// but every per-token tensor becomes a `[N × *]` row-major batch and every
+/// kernel call uses the `_batched` variant.
+///
+/// Inputs (live in `scratch.pb_*`):
+///   - pb_attn_out[N × dim]: post-attention output (input to pre_norm_2 and router)
+///   - pb_ffn_out [N × dim]: dense FFN output  (input to post_norm_1)
+///
+/// Output:
+///   - pb_moe_pre2[N × dim] holds the post-FFN-layernorm(cur_mlp + cur_moe) —
+///     i.e. what the per-token path writes to `scratch.tmp`. Caller adds it
+///     to the per-token residual + applies the layer scalar.
+///
+/// Only the indexed-fast path (MQ4G256 gate_up + HFQ4G128/Q8_0 down) is wired.
+/// Falls back to per-token calls when the quant mix doesn't match (slow but
+/// correct).
+fn apply_moe_branch_batched(
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    scratch: &Gemma4Scratch,
+    moe: &MoeLayerExtras,
+    post_ffn_norm: &GpuTensor,
+    n_batch: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let mi = config.moe_intermediate_size;
+    let n_exp = config.num_experts;
+    let k_top = config.top_k_experts;
+    if k_top != 8 {
+        return Err(hip_bridge::HipError::new(
+            0, &format!("MoE top_k_experts={k_top} unsupported (kernel hardcoded to 8)"),
+        ));
+    }
+    debug_assert!(n_batch <= scratch.max_prefill_batch,
+        "n_batch={n_batch} > MAX_PREFILL_BATCH={}", scratch.max_prefill_batch);
+
+    let first = &moe.experts[0];
+    let gate_ok = first.gate_up_proj.gpu_dtype == rdna_compute::DType::MQ4G256;
+    let down_hfq4g128 = first.down_proj.gpu_dtype == rdna_compute::DType::HFQ4G128;
+    if !gate_ok || !down_hfq4g128 {
+        return Err(hip_bridge::HipError::new(
+            0, &format!("apply_moe_branch_batched: unsupported quant mix \
+                (gate_up={:?} down={:?}). Only MQ4G256+HFQ4G128 wired for batch.",
+                first.gate_up_proj.gpu_dtype, first.down_proj.gpu_dtype),
+        ));
+    }
+
+    // 1) cur_mlp_batch = post_feedforward_layernorm_1(pb_ffn_out)
+    gpu.rmsnorm_batched(&scratch.pb_ffn_out, &moe.post_feedforward_layernorm_1,
+        &scratch.pb_moe_cur_mlp, n_batch, dim, config.norm_eps)?;
+
+    // 2) pre2_batch = pre_feedforward_layernorm_2(pb_attn_out)
+    gpu.rmsnorm_batched(&scratch.pb_attn_out, &moe.pre_feedforward_layernorm_2,
+        &scratch.pb_moe_pre2, n_batch, dim, config.norm_eps)?;
+
+    // 3) router_in = rmsnorm(attn_out, router_scale) / sqrt(dim)
+    gpu.rmsnorm_batched(&scratch.pb_attn_out, &moe.router_scale,
+        &scratch.pb_moe_router_in, n_batch, dim, config.norm_eps)?;
+    gpu.scale_f32(&scratch.pb_moe_router_in, 1.0 / (dim as f32).sqrt())?;
+    // scale_f32 operates on the full tensor — for [N × dim] this scales
+    // every element, which is what we want (each row is divided by sqrt(dim)).
+
+    // 4) Router GEMM → logits [N × n_exp]
+    weight_gemm(gpu, &moe.router_proj, &scratch.pb_moe_router_in,
+        &scratch.pb_moe_router_logits, n_batch)?;
+
+    // 5) Batched top-K softmax + renorm.
+    gpu.moe_softmax_topk_renorm_k8_batched(
+        &scratch.pb_moe_router_logits,
+        &scratch.pb_moe_topk_indices,
+        &scratch.pb_moe_topk_weights,
+        n_exp,
+        true,
+        n_batch,
+    )?;
+
+    // 6) Pre-rotate pre2_batch via FWHT (MQ4 indexed gate_up expects rotated x).
+    gpu.rotate_x_mq_batched(&scratch.pb_moe_pre2, &scratch.pb_moe_pre2_rot,
+        dim, n_batch)?;
+
+    // 7) Batched indexed gate_up — one launch for N × K_TOP × MI outputs.
+    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+        &moe.experts_gate_up_ptrs,
+        &scratch.pb_moe_topk_indices,
+        &scratch.pb_moe_pre2_rot,
+        &scratch.pb_moe_gate_batch,
+        &scratch.pb_moe_up_batch,
+        2 * mi, dim, k_top, n_batch,
+    )?;
+
+    // 8) Batched gelu_tanh + mul over [N × K_TOP × MI].
+    gpu.gelu_tanh_f32(&scratch.pb_moe_gate_batch,
+        &scratch.pb_moe_hidden_batch, n_batch * k_top * mi)?;
+    gpu.mul_f32(&scratch.pb_moe_hidden_batch,
+        &scratch.pb_moe_up_batch,
+        &scratch.pb_moe_hidden_batch)?;
+
+    // 9) Zero cur_moe_batch accumulator.
+    let dim_bytes = dim * 4;
+    if let Some(s) = gpu.active_stream.as_ref() {
+        gpu.hip.memset_async(&scratch.pb_moe_cur_moe.buf, 0, n_batch * dim_bytes, s)?;
+    } else {
+        gpu.hip.memset(&scratch.pb_moe_cur_moe.buf, 0, n_batch * dim_bytes)?;
+    }
+
+    // 10) Batched indexed down + scaled residual. atomicAdd into pb_moe_cur_moe.
+    gpu.gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(
+        &moe.experts_down_ptrs,
+        &scratch.pb_moe_topk_indices,
+        &scratch.pb_moe_topk_weights,
+        &moe.per_expert_scale,
+        &scratch.pb_moe_hidden_batch,
+        &scratch.pb_moe_cur_moe,
+        dim, mi, k_top, n_batch,
+    )?;
+
+    // 11) post_feedforward_layernorm_2(cur_moe) in-place batched.
+    gpu.rmsnorm_batched(&scratch.pb_moe_cur_moe, &moe.post_feedforward_layernorm_2,
+        &scratch.pb_moe_cur_moe, n_batch, dim, config.norm_eps)?;
+
+    // 12) combined = cur_mlp + cur_moe → reuse pb_moe_pre2 as the combined buffer.
+    gpu.add_f32(&scratch.pb_moe_cur_mlp, &scratch.pb_moe_cur_moe,
+        &scratch.pb_moe_pre2)?;
+
+    // 13) post_feedforward_layernorm(combined) → batched, in-place.
+    gpu.rmsnorm_batched(&scratch.pb_moe_pre2, post_ffn_norm,
+        &scratch.pb_moe_pre2, n_batch, dim, config.norm_eps)?;
+
+    Ok(())
+}
+
 /// Single-token decode. Phase 3 implementation.
 ///
 /// Precondition: `scratch.sliding_cos/sin` + `scratch.full_cos/sin` +
@@ -1420,6 +1627,36 @@ fn sliding_layer_decode(
     kv_layer_idx: usize,
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
+    sliding_layer_decode_impl(gpu, config, lw, pos, kv_cache, kv_layer_idx, scratch, false)
+}
+
+/// As `sliding_layer_decode` but with `stop_before_moe=true`, the function
+/// returns immediately after the dense FFN computes `scratch.ffn_out`,
+/// leaving `scratch.residual` holding the post-attention x. Used by
+/// `forward_prefill_chunk` to interleave per-token attention with a
+/// batched MoE call across all N tokens.
+fn sliding_layer_attn_ffn_only(
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    lw: &SlidingLayerWeights,
+    pos: usize,
+    kv_cache: &mut hipfire_runtime::llama::KvCache,
+    kv_layer_idx: usize,
+    scratch: &Gemma4Scratch,
+) -> HipResult<()> {
+    sliding_layer_decode_impl(gpu, config, lw, pos, kv_cache, kv_layer_idx, scratch, true)
+}
+
+fn sliding_layer_decode_impl(
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    lw: &SlidingLayerWeights,
+    pos: usize,
+    kv_cache: &mut hipfire_runtime::llama::KvCache,
+    kv_layer_idx: usize,
+    scratch: &Gemma4Scratch,
+    stop_before_moe: bool,
+) -> HipResult<()> {
     let dim = config.dim;
     let head_dim = config.sliding_head_dim;
     let n_heads = config.n_heads;
@@ -1563,6 +1800,11 @@ fn sliding_layer_decode(
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
 
+    // Batched prefill hand-off point: caller wants to batch the MoE branch
+    // across N tokens. Return now with scratch.ffn_out + scratch.residual
+    // populated; caller assembles the batched MoE call externally.
+    if stop_before_moe { return Ok(()); }
+
     // Sandwich post-FFN norm. On MoE layers (26B-A4B) this is folded into
     // apply_moe_branch (which adds the parallel MoE branch + sandwich norms
     // 1 and 2 before this outer norm); on dense layers we just call the
@@ -1618,6 +1860,31 @@ fn full_layer_decode(
     kv_cache: &mut hipfire_runtime::llama::KvCache,
     kv_layer_idx: usize,
     scratch: &Gemma4Scratch,
+) -> HipResult<()> {
+    full_layer_decode_impl(gpu, config, lw, pos, kv_cache, kv_layer_idx, scratch, false)
+}
+
+fn full_layer_attn_ffn_only(
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    lw: &FullLayerWeights,
+    pos: usize,
+    kv_cache: &mut hipfire_runtime::llama::KvCache,
+    kv_layer_idx: usize,
+    scratch: &Gemma4Scratch,
+) -> HipResult<()> {
+    full_layer_decode_impl(gpu, config, lw, pos, kv_cache, kv_layer_idx, scratch, true)
+}
+
+fn full_layer_decode_impl(
+    gpu: &mut Gpu,
+    config: &Gemma4Config,
+    lw: &FullLayerWeights,
+    pos: usize,
+    kv_cache: &mut hipfire_runtime::llama::KvCache,
+    kv_layer_idx: usize,
+    scratch: &Gemma4Scratch,
+    stop_before_moe: bool,
 ) -> HipResult<()> {
     let dim = config.dim;
     let head_dim = config.full_head_dim;
@@ -1736,6 +2003,9 @@ fn full_layer_decode(
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
     weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
 
+    // Batched prefill hand-off (see sliding_layer_decode_impl for rationale).
+    if stop_before_moe { return Ok(()); }
+
     // Sandwich post-FFN norm. Same MoE dispatch as sliding_layer_decode.
     let moe_bypass = std::env::var("HIPFIRE_MOE_BYPASS").ok().as_deref() == Some("1");
     match (lw.moe.as_ref(), moe_bypass) {
@@ -1759,16 +2029,166 @@ fn full_layer_decode(
     Ok(())
 }
 
-/// Batched prefill. Phase 4.
+/// Token-batched prefill. Processes up to `scratch.max_prefill_batch` tokens
+/// at once, amortizing MoE-branch launch overhead across the batch via the
+/// batched-indexed kernels (router GEMM, top-K, gate_up, gelu*mul, down).
+///
+/// Per-token operations (attention, dense projections, RoPE, KV writes)
+/// stay per-token in V1 — no batched flash-prefill kernel for asym3
+/// sliding window. The win comes from collapsing N per-token MoE calls
+/// (~10 launches each) into one batched MoE call per layer.
+///
+/// On exit: `kv_sliding` / `kv_full` are updated for every token. The KV
+/// cache is the source of truth for downstream sampling; this function
+/// does NOT compute logits (the caller should follow with a per-token
+/// `forward_scratch` for the LAST token if it needs logits).
 pub fn forward_prefill_batch(
-    _gpu: &mut Gpu,
-    _weights: &Gemma4Weights,
-    _config: &Gemma4Config,
-    _tokens: &[u32],
-    _start_pos: usize,
-    _kv_sliding: &mut hipfire_runtime::llama::KvCache,
-    _kv_full: &mut hipfire_runtime::llama::KvCache,
-    _scratch: &Gemma4Scratch,
+    gpu: &mut Gpu,
+    weights: &Gemma4Weights,
+    config: &Gemma4Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_sliding: &mut hipfire_runtime::llama::KvCache,
+    kv_full: &mut hipfire_runtime::llama::KvCache,
+    scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
-    Err(hip_bridge::HipError::new(0, "gemma4::forward_prefill_batch not implemented (Phase 4)"))
+    let n_batch = tokens.len();
+    if n_batch == 0 { return Ok(()); }
+    if n_batch > scratch.max_prefill_batch {
+        return Err(hip_bridge::HipError::new(0, &format!(
+            "forward_prefill_batch: n_batch={n_batch} > max_prefill_batch={}; \
+             caller must chunk", scratch.max_prefill_batch)));
+    }
+    let dim = config.dim;
+    let dim_bytes = dim * 4;
+
+    // ── Step 1: per-token embed + scale into pb_residual[i]. ─────────────
+    for (i, &tok) in tokens.iter().enumerate() {
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.embed_tokens, &scratch.x, tok, dim)?,
+            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.embed_tokens, &scratch.x, tok, dim)?,
+            EmbeddingFormat::Q8_0    => gpu.embedding_lookup_q8(&weights.embed_tokens, &scratch.x, tok, dim)?,
+            EmbeddingFormat::F32     => gpu.embedding_lookup(&weights.embed_tokens, &scratch.x, tok, dim)?,
+            _ => return Err(hip_bridge::HipError::new(0, "unsupported Gemma 4 embed format")),
+        }
+        gpu.scale_f32(&scratch.x, config.embed_scale)?;
+        // pb_residual[i] = scratch.x
+        let stream = gpu.active_stream.as_ref();
+        if let Some(s) = stream {
+            gpu.hip.memcpy_dtod_async_at(&scratch.pb_residual.buf, i * dim_bytes,
+                &scratch.x.buf, 0, dim_bytes, s)?;
+        } else {
+            gpu.hip.memcpy_dtod_at(&scratch.pb_residual.buf, i * dim_bytes, &scratch.x.buf, 0, dim_bytes)?;
+        }
+    }
+
+    // ── Step 2: layer loop. Each layer: per-token attn+FFN, then batched MoE. ──
+    let mut sliding_kv_idx = 0usize;
+    let mut full_kv_idx = 0usize;
+    for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
+        // Stage A — per-token attn + FFN. Fills pb_attn_out[i] = post-attn x,
+        // pb_ffn_out[i] = dense FFN out. Also writes the per-token KV at
+        // position start_pos+i.
+        let stream_present = gpu.active_stream.is_some();
+        for i in 0..n_batch {
+            let pos = start_pos + i;
+            let pos_i32 = pos as i32;
+            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+            // Load this token's residual into scratch.x.
+            if stream_present {
+                let s = gpu.active_stream.as_ref().unwrap();
+                gpu.hip.memcpy_dtod_async_at(&scratch.x.buf, 0,
+                    &scratch.pb_residual.buf, i * dim_bytes, dim_bytes, s)?;
+            } else {
+                gpu.hip.memcpy_dtod_at(&scratch.x.buf, 0, &scratch.pb_residual.buf, i * dim_bytes, dim_bytes)?;
+            }
+            match (layer_type, &weights.layers[layer_idx]) {
+                (LayerType::Sliding, LayerWeights::Sliding(lw)) => {
+                    sliding_layer_attn_ffn_only(gpu, config, lw, pos, kv_sliding,
+                        sliding_kv_idx, scratch)?;
+                }
+                (LayerType::Full, LayerWeights::Full(lw)) => {
+                    full_layer_attn_ffn_only(gpu, config, lw, pos, kv_full,
+                        full_kv_idx, scratch)?;
+                }
+                _ => return Err(hip_bridge::HipError::new(0, &format!(
+                    "Gemma 4 layer {} type/weights mismatch", layer_idx))),
+            }
+            // Copy outputs into batch slots:
+            //   pb_attn_out[i] = scratch.residual (post-attn x; input to MoE pre2/router_in)
+            //   pb_ffn_out [i] = scratch.ffn_out  (dense FFN output)
+            //   pb_residual[i] = scratch.residual (running residual)
+            if stream_present {
+                let s = gpu.active_stream.as_ref().unwrap();
+                gpu.hip.memcpy_dtod_async_at(&scratch.pb_attn_out.buf, i * dim_bytes,
+                    &scratch.residual.buf, 0, dim_bytes, s)?;
+                gpu.hip.memcpy_dtod_async_at(&scratch.pb_ffn_out.buf, i * dim_bytes,
+                    &scratch.ffn_out.buf, 0, dim_bytes, s)?;
+                gpu.hip.memcpy_dtod_async_at(&scratch.pb_residual.buf, i * dim_bytes,
+                    &scratch.residual.buf, 0, dim_bytes, s)?;
+            } else {
+                gpu.hip.memcpy_dtod_at(&scratch.pb_attn_out.buf, i * dim_bytes, &scratch.residual.buf, 0, dim_bytes)?;
+                gpu.hip.memcpy_dtod_at(&scratch.pb_ffn_out.buf, i * dim_bytes, &scratch.ffn_out.buf, 0, dim_bytes)?;
+                gpu.hip.memcpy_dtod_at(&scratch.pb_residual.buf, i * dim_bytes, &scratch.residual.buf, 0, dim_bytes)?;
+            }
+        }
+        match layer_type {
+            LayerType::Sliding => sliding_kv_idx += 1,
+            LayerType::Full => full_kv_idx += 1,
+        }
+
+        // Stage B — batched MoE branch (or dense post-FFN on layers without MoE).
+        let layer_scalar = match (layer_type, &weights.layers[layer_idx]) {
+            (LayerType::Sliding, LayerWeights::Sliding(lw)) => lw.layer_scalar_host,
+            (LayerType::Full, LayerWeights::Full(lw)) => lw.layer_scalar_host,
+            _ => unreachable!(),
+        };
+        let (moe_opt, post_ffn_norm) = match (layer_type, &weights.layers[layer_idx]) {
+            (LayerType::Sliding, LayerWeights::Sliding(lw)) =>
+                (lw.moe.as_ref(), &lw.post_feedforward_layernorm),
+            (LayerType::Full, LayerWeights::Full(lw)) =>
+                (lw.moe.as_ref(), &lw.post_feedforward_layernorm),
+            _ => unreachable!(),
+        };
+        match moe_opt {
+            Some(moe) => {
+                apply_moe_branch_batched(gpu, config, scratch, moe,
+                    post_ffn_norm, n_batch)?;
+                // Stage C — batched residual add + layer scale.
+                // pb_residual[0..N×dim] += pb_moe_pre2[0..N×dim]
+                gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_moe_pre2)?;
+                gpu.scale_f32(&scratch.pb_residual, layer_scalar)?;
+            }
+            None => {
+                // Dense path — fall back to per-token finalization to keep
+                // semantics identical to single-token forward.
+                for i in 0..n_batch {
+                    if stream_present {
+                        let s = gpu.active_stream.as_ref().unwrap();
+                        gpu.hip.memcpy_dtod_async_at(&scratch.x.buf, 0,
+                            &scratch.pb_residual.buf, i * dim_bytes, dim_bytes, s)?;
+                        gpu.hip.memcpy_dtod_async_at(&scratch.residual.buf, 0,
+                            &scratch.pb_residual.buf, i * dim_bytes, dim_bytes, s)?;
+                        gpu.hip.memcpy_dtod_async_at(&scratch.ffn_out.buf, 0,
+                            &scratch.pb_ffn_out.buf, i * dim_bytes, dim_bytes, s)?;
+                    }
+                    gpu.rmsnorm_f32(&scratch.ffn_out, post_ffn_norm,
+                        &scratch.tmp, config.norm_eps)?;
+                    if stream_present {
+                        let s = gpu.active_stream.as_ref().unwrap();
+                        gpu.hip.memcpy_dtod_async_at(&scratch.x.buf, 0,
+                            &scratch.residual.buf, 0, dim_bytes, s)?;
+                    }
+                    gpu.add_inplace_f32(&scratch.x, &scratch.tmp)?;
+                    gpu.scale_f32(&scratch.x, layer_scalar)?;
+                    if stream_present {
+                        let s = gpu.active_stream.as_ref().unwrap();
+                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_residual.buf, i * dim_bytes,
+                            &scratch.x.buf, 0, dim_bytes, s)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }

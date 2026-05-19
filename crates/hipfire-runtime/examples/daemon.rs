@@ -3505,6 +3505,61 @@ fn generate_gemma4(
     let prefill_start = Instant::now();
     let prefill_len = tokens_to_prefill.len();
     tlog!("prefill loop start, {} new tokens", prefill_len);
+
+    // Token-batched prefill path. Activated when prefill is large enough that
+    // amortizing MoE launch overhead across N tokens dominates the per-token
+    // copy cost. Threshold tuned for 26B-A4B on gfx1201; smaller chunks fall
+    // through to the per-token loop (which also handles correctness gracefully
+    // for non-MoE Gemma 4 variants).
+    const PREFILL_BATCH_THRESHOLD: usize = 16;
+    const PREFILL_BATCH_SIZE: usize = 64;
+    let use_batched = prefill_len >= PREFILL_BATCH_THRESHOLD
+        && std::env::var("HIPFIRE_PREFILL_BATCH").ok().as_deref() != Some("0");
+    if use_batched {
+        let mut i = 0usize;
+        while i < prefill_len {
+            let n = (prefill_len - i).min(PREFILL_BATCH_SIZE);
+            let chunk = &tokens_to_prefill[i..i + n];
+            let start_pos = m.seq_pos + i;
+            if let Err(e) = gemma4::forward_prefill_batch(
+                gpu, weights, config, chunk, start_pos, kv_sliding, kv_full, scratch,
+            ) {
+                let _ = writeln!(stdout,
+                    r#"{{"type":"error","id":"{}","message":"gemma4 batched prefill: {}"}}"#, id, e);
+                let _ = stdout.flush();
+                return;
+            }
+            for &tok in chunk { m.conversation_tokens.push(tok); }
+            i += n;
+            if i < prefill_len && (i / PROGRESS_INTERVAL) > ((i - n) / PROGRESS_INTERVAL) {
+                let _ = writeln!(stdout,
+                    r#"{{"type":"prefill_progress","id":"{}","pos":{},"total":{}}}"#,
+                    id, i, prefill_len);
+                let _ = stdout.flush();
+            }
+        }
+        // After batched prefill, KV caches are populated but scratch.logits is
+        // STALE — forward_prefill_batch skips lm_head. Run one extra per-token
+        // forward on the LAST prefilled token to populate logits for sampling.
+        // This duplicates one token's compute but keeps the rest of the path
+        // (sampler, EOS detection, etc.) unchanged. Subtract that token's KV
+        // write from the seq_pos accounting since it was already done in batch.
+        let last_tok = *tokens_to_prefill.last().unwrap();
+        let last_pos = m.seq_pos + prefill_len - 1;
+        // Rewind one KV slot so the duplicate write doesn't break ring buffer
+        // semantics on sliding KV. Sliding writes at pos % cap, so writing
+        // the same pos twice overwrites the same slot — semantically a no-op
+        // for correctness, just wasted bandwidth. Full KV is direct addressed
+        // and same story — overwriting slot=last_pos with the same value.
+        if let Err(e) = gemma4::forward_scratch(
+            gpu, weights, config, last_tok, last_pos, kv_sliding, kv_full, scratch,
+        ) {
+            let _ = writeln!(stdout,
+                r#"{{"type":"error","id":"{}","message":"gemma4 last-token logits: {}"}}"#, id, e);
+            let _ = stdout.flush();
+            return;
+        }
+    } else {
     for (i, &tok) in tokens_to_prefill.iter().enumerate() {
         let pos = m.seq_pos + i;
         if let Err(e) = gemma4::forward_scratch(
@@ -3522,6 +3577,7 @@ fn generate_gemma4(
                 id, i + 1, prefill_len);
             let _ = stdout.flush();
         }
+    }
     }
     m.seq_pos += prefill_len;
     let prefill_elapsed = prefill_start.elapsed().as_secs_f64();
